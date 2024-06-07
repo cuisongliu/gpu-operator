@@ -14,14 +14,29 @@
 
 ARG CUDA_IMAGE=nvcr.io/nvidia/cuda
 ARG CUDA_VERSION=undefined
-ARG GIT_COMMIT="unknown"
 
 ARG BASE_DIST=ubi8
+ARG GOLANG_VERSION=x.x.x
 
-ARG GOLANG_VERSION=1.20.1
-ARG BUILDER_IMAGE=golang:${GOLANG_VERSION}
+FROM ${CUDA_IMAGE}:${CUDA_VERSION}-base-${BASE_DIST} as builder
 
-FROM ${BUILDER_IMAGE} as builder
+RUN yum install -y wget make git gcc
+
+ARG GOLANG_VERSION=0.0.0
+RUN set -eux; \
+    \
+    arch="$(uname -m)"; \
+    case "${arch##*-}" in \
+        x86_64 | amd64) ARCH='amd64' ;; \
+        ppc64el | ppc64le) ARCH='ppc64le' ;; \
+        aarch64) ARCH='arm64' ;; \
+        *) echo "unsupported architecture" ; exit 1 ;; \
+    esac; \
+    wget -nv -O - https://storage.googleapis.com/golang/go${GOLANG_VERSION}.linux-${ARCH}.tar.gz \
+    | tar -C /usr/local -xz
+
+ENV GOPATH /go
+ENV PATH $GOPATH/bin:/usr/local/go/bin:$PATH
 
 WORKDIR /workspace
 # Copy the Go Modules manifests
@@ -30,13 +45,19 @@ COPY go.sum go.sum
 COPY vendor vendor
 
 # Copy the go source
-COPY main.go main.go
+COPY cmd/ cmd/
 COPY api/ api/
 COPY controllers/ controllers/
+COPY internal/ internal/
+
+# Copy Makefile
+COPY Makefile Makefile
+COPY *.mk .
 
 # Build
-RUN CGO_ENABLED=0 GOOS=linux GO111MODULE=on \
-    go build -a -o gpu-operator main.go
+ARG VERSION="unknown"
+ARG GIT_COMMIT="unknown"
+RUN make gpu-operator
 
 FROM ${CUDA_IMAGE}:${CUDA_VERSION}-base-${BASE_DIST}
 
@@ -45,8 +66,7 @@ RUN dnf remove -y cuda-*
 
 ENV NVIDIA_VISIBLE_DEVICES=void
 
-ARG VERSION
-ARG TARGETARCH
+ARG VERSION="unknown"
 ARG GIT_COMMIT="unknown"
 
 LABEL io.k8s.display-name="NVIDIA GPU Operator"
@@ -61,21 +81,21 @@ LABEL vsc-ref=${GIT_COMMIT}
 WORKDIR /
 COPY --from=builder /workspace/gpu-operator /usr/bin/
 
-RUN mkdir -p /opt/gpu-operator
+RUN mkdir -p /opt/gpu-operator/manifests
 COPY assets /opt/gpu-operator/
+COPY manifests /opt/gpu-operator/manifests
 RUN mkdir /licenses && mv /NGC-DL-CONTAINER-LICENSE /licenses/NGC-DL-CONTAINER-LICENSE
 COPY hack/must-gather.sh /usr/bin/gather
 
-ENV VERSION=${VERSION}
-ENV GIT_COMMIT=${GIT_COMMIT}
-
 # Install must-gather dependency: `kubectl`
+ARG TARGETARCH
 RUN OS_ARCH=${TARGETARCH/x86_64/amd64} && OS_ARCH=${OS_ARCH/aarch64/arm64} && curl -LO https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/${OS_ARCH}/kubectl
 RUN chmod +x ./kubectl
 RUN mv ./kubectl /usr/local/bin
 
 # Add CRD resource into the image for helm upgrades
 COPY deployments/gpu-operator/crds/nvidia.com_clusterpolicies_crd.yaml /opt/gpu-operator/nvidia.com_clusterpolicies_crd.yaml
+COPY deployments/gpu-operator/crds/nvidia.com_nvidiadrivers.yaml /opt/gpu-operator/nvidia.com_nvidiadrivers.yaml
 COPY deployments/gpu-operator/charts/node-feature-discovery/crds/nfd-api-crds.yaml /opt/gpu-operator/nfd-api-crds.yaml
 
 # Install / upgrade packages here that are required to resolve CVEs

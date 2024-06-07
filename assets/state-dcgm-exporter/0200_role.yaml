@@ -15,15 +15,8 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - configmaps
   - pods
   verbs:
   - get
   - list
-- apiGroups:
-  - policy
-  resources:
-  - podsecuritypolicies
-  verbs:
-  - use
-  resourceNames:
-  - gpu-operator-privileged

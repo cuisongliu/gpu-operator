@@ -1,4 +1,4 @@
-#! /bin/bash
+#!/bin/bash
 
 if [[ "${SKIP_UPDATE}" == "true" ]]; then
     echo "Skipping update: SKIP_UPDATE=${SKIP_UPDATE}"
@@ -33,6 +33,9 @@ test_image_updates() {
     echo "driver daemonset image updated successfully to version $TARGET_DRIVER_VERSION, deleting pod to trigger update"
     # Delete driver pod to trigger update due to OnDelete policy
     kubectl delete pod -l app=nvidia-driver-daemonset -n $TEST_NAMESPACE
+
+    # Wait for the driver upgrade to transition to "upgrade-done" state
+    wait_for_driver_upgrade_done
 
     # Verify that driver-daemonset is running successfully after update
     check_pod_ready "nvidia-driver-daemonset"
@@ -109,6 +112,13 @@ test_enable_dcgm() {
     # Verify that standalone nvidia-dcgm and exporter pods are running successfully after update
     check_pod_ready "nvidia-dcgm"
     check_pod_ready "nvidia-dcgm-exporter"
+
+    # Test that nvidia-dcgm service is created with interalTrafficPolicy set to "local"
+    trafficPolicy=$(kubectl  get service nvidia-dcgm -n $TEST_NAMESPACE -o json | jq -r '.spec.internalTrafficPolicy')
+    if [ "$trafficPolicy" != "Local" ]; then
+        echo "service nvidia-dcgm is missing or internal traffic policy is not set to local"
+        exit 1
+    fi
 }
 
 test_gpu_sharing() {
@@ -125,6 +135,15 @@ test_gpu_sharing() {
     check_pod_ready "gpu-feature-discovery"
 
     echo "validating workloads on timesliced GPU"
+
+    shared_product_name="${GPU_PRODUCT_NAME}-SHARED"
+
+    # set the operator validator image version in the plugin test spec
+    sed -i "s/image: nvcr.io\/nvidia\/cloud-native\/gpu-operator-validator:v1.10.1/image: ${VALIDATOR_IMAGE//\//\\/}:${VALIDATOR_VERSION}/g" ${TEST_DIR}/plugin-test.yaml
+    
+    # set the name of GPU product in plugin test spec
+    sed -i "s/nvidia.com\/gpu.product: Tesla-T4-SHARED/nvidia.com\/gpu.product: ${shared_product_name}/g" ${TEST_DIR}/plugin-test.yaml
+
     # Deploy test-pod to validate GPU sharing
     kubectl apply -f ${TEST_DIR}/plugin-test.yaml -n $TEST_NAMESPACE
 
@@ -143,7 +162,7 @@ test_gpu_sharing() {
     fi
 
     product_name=$(kubectl  get node -o json | jq '.items[0].metadata.labels["nvidia.com/gpu.product"]' | tr -d '"')
-    if [ "$product_name" != "Tesla-T4-SHARED" ]; then
+    if [ "$product_name" != ${shared_product_name} ]; then
         echo "Label nvidia.com/gpu.product is incorrect when GPU sharing is enabled - $product_name"
         exit 1
     fi
@@ -211,7 +230,10 @@ test_custom_labels_override() {
     exit 1
   fi
 
-  operands="nvidia-container-toolkit-daemonset nvidia-operator-validator gpu-feature-discovery nvidia-dcgm-exporter nvidia-device-plugin-daemonset"
+  operands="nvidia-driver-daemonset nvidia-container-toolkit-daemonset nvidia-operator-validator gpu-feature-discovery nvidia-dcgm-exporter nvidia-device-plugin-daemonset"
+
+  # The labels override triggers a rollout of all gpu-operator operands, so we wait for the driver upgrade to transition to "upgrade-done" state.
+  wait_for_driver_upgrade_done
 
   for operand in $operands
   do

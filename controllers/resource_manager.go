@@ -1,3 +1,19 @@
+/**
+# Copyright (c) NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+**/
+
 package controllers
 
 import (
@@ -11,13 +27,11 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	nodev1 "k8s.io/api/node/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	schedv1 "k8s.io/api/scheduling/v1beta1"
 
 	secv1 "github.com/openshift/api/security/v1"
 
-	"golang.org/x/mod/semver"
 	"k8s.io/apimachinery/pkg/runtime/serializer/json"
 	"k8s.io/client-go/kubernetes/scheme"
 )
@@ -28,8 +42,6 @@ const (
 )
 
 type assetsFromFile []byte
-
-var manifests []assetsFromFile
 
 // Resources indicates resources managed by GPU operator
 type Resources struct {
@@ -47,7 +59,6 @@ type Resources struct {
 	PriorityClass              schedv1.PriorityClass
 	Taint                      corev1.Taint
 	SecurityContextConstraints secv1.SecurityContextConstraints
-	PodSecurityPolicy          policyv1beta1.PodSecurityPolicy
 	RuntimeClasses             []nodev1.RuntimeClass
 	PrometheusRule             promv1.PrometheusRule
 }
@@ -56,7 +67,7 @@ func filePathWalkDir(n *ClusterPolicyController, root string) ([]string, error) 
 	var files []string
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			n.rec.Log.V(1).Info("error in filepath.Walk on %s: %v", root, err)
+			n.logger.V(1).Info("error in filepath.Walk on %s: %v", root, err)
 			return nil
 		}
 		if !info.IsDir() {
@@ -92,19 +103,19 @@ func addResourcesControls(n *ClusterPolicyController, path string) (Resources, c
 	res := Resources{}
 	ctrl := controlFunc{}
 
-	n.rec.Log.Info("Getting assets from: ", "path:", path)
+	n.logger.Info("Getting assets from: ", "path:", path)
 	manifests := getAssetsFrom(n, path, n.openshift)
 
 	s := json.NewSerializerWithOptions(json.DefaultMetaFactory, scheme.Scheme,
 		scheme.Scheme, json.SerializerOptions{Yaml: true, Pretty: false, Strict: false})
-	reg, _ := regexp.Compile(`\b(\w*kind:\w*)\B.*\b`)
+	reg := regexp.MustCompile(`\b(\w*kind:\w*)\B.*\b`)
 
 	for _, m := range manifests {
 		kind := reg.FindString(string(m))
 		slce := strings.Split(kind, ":")
 		kind = strings.TrimSpace(slce[1])
 
-		n.rec.Log.V(1).Info("Looking for ", "Kind", kind, "in path:", path)
+		n.logger.V(1).Info("Looking for ", "Kind", kind, "in path:", path)
 
 		switch kind {
 		case "ServiceAccount":
@@ -165,20 +176,12 @@ func addResourcesControls(n *ClusterPolicyController, path string) (Resources, c
 			if len(res.RuntimeClasses) == 1 {
 				ctrl = append(ctrl, RuntimeClasses)
 			}
-		case "PodSecurityPolicy":
-			if n.openshift != "" || semver.Compare(n.k8sVersion, pspRemovalAPIVersion) >= 0 {
-				n.rec.Log.Info("PodSecurityPolicy API is not supported. Skipping...")
-				continue
-			}
-			_, _, err := s.Decode(m, nil, &res.PodSecurityPolicy)
-			panicIfError(err)
-			ctrl = append(ctrl, PodSecurityPolicy)
 		case "PrometheusRule":
 			_, _, err := s.Decode(m, nil, &res.PrometheusRule)
 			panicIfError(err)
 			ctrl = append(ctrl, PrometheusRule)
 		default:
-			n.rec.Log.Info("Unknown Resource", "Manifest", m, "Kind", kind)
+			n.logger.Info("Unknown Resource", "Manifest", m, "Kind", kind)
 		}
 
 	}

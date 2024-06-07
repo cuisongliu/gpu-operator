@@ -16,14 +16,8 @@ rules:
   - ""
   resources:
   - pods
-  - nodes
   verbs:
-  - '*'
-- apiGroups:
-  - policy
-  resources:
-  - podsecuritypolicies
-  verbs:
-  - use
-  resourceNames:
-  - gpu-operator-privileged
+  - get
+  - list
+  - watch
+  - delete

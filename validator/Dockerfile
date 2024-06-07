@@ -17,16 +17,37 @@ ARG CUDA_VERSION=undefined
 ARG CUDA_SAMPLE_IMAGE=undefined
 
 ARG BASE_DIST=ubi8
+ARG GOLANG_VERSION=x.x.x
 
-ARG GOLANG_VERSION=1.20.1
-ARG BUILDER_IMAGE=golang:${GOLANG_VERSION}
+FROM ${CUDA_IMAGE}:${CUDA_VERSION}-base-${BASE_DIST} as build
 
-FROM ${BUILDER_IMAGE} AS build
+RUN yum install -y wget make git gcc
+
+ARG GOLANG_VERSION=0.0.0
+RUN set -eux; \
+    \
+    arch="$(uname -m)"; \
+    case "${arch##*-}" in \
+        x86_64 | amd64) ARCH='amd64' ;; \
+        ppc64el | ppc64le) ARCH='ppc64le' ;; \
+        aarch64) ARCH='arm64' ;; \
+        *) echo "unsupported architecture" ; exit 1 ;; \
+    esac; \
+    wget -nv -O - https://storage.googleapis.com/golang/go${GOLANG_VERSION}.linux-${ARCH}.tar.gz \
+    | tar -C /usr/local -xz
+
+ENV GOPATH /go
+ENV PATH $GOPATH/bin:/usr/local/go/bin:$PATH
 
 WORKDIR /build
 COPY . .
 
-RUN go build -o /artifacts/nvidia-validator ./validator
+ARG VERSION="unknown"
+ARG GIT_COMMIT="unknown"
+
+RUN mkdir /artifacts
+RUN make -C validator/ validator
+RUN cp /build/validator/validator /artifacts/nvidia-validator
 RUN cp /build/validator/plugin-workload-validation.yaml /artifacts/
 RUN cp /build/validator/cuda-workload-validation.yaml /artifacts/
 
@@ -55,14 +76,17 @@ ENV NVIDIA_DISABLE_REQUIRE="true"
 ENV NVIDIA_VISIBLE_DEVICES=void
 ENV NVIDIA_DRIVER_CAPABILITIES=utility,compute
 
-ARG VERSION="N/A"
-LABEL version=${VERSION}
+ARG VERSION="unknown"
+ARG GIT_COMMIT="unknown"
+
+LABEL version="${VERSION}"
 LABEL release="N/A"
 LABEL vendor="NVIDIA"
 LABEL io.k8s.display-name="NVIDIA Validators for the GPU Operator Components"
 LABEL name="NVIDIA Validator for the GPU Operator"
 LABEL summary="NVIDIA Validator for the GPU Operator"
 LABEL description="See summary"
+LABEL vsc-ref=${GIT_COMMIT}
 
 # Install / upgrade packages here that are required to resolve CVEs
 ARG CVE_UPDATES

@@ -28,13 +28,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/NVIDIA/go-nvlib/pkg/nvmdev"
+	"github.com/NVIDIA/go-nvlib/pkg/nvpci"
 	devchar "github.com/NVIDIA/nvidia-container-toolkit/cmd/nvidia-ctk/system/create-dev-char-symlinks"
 	log "github.com/sirupsen/logrus"
 	cli "github.com/urfave/cli/v2"
-	"gitlab.com/nvidia/cloud-native/go-nvlib/pkg/nvmdev"
-	"gitlab.com/nvidia/cloud-native/go-nvlib/pkg/nvpci"
 
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -43,6 +43,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+
+	"github.com/NVIDIA/gpu-operator/internal/info"
 )
 
 // Component of GPU operator
@@ -81,8 +83,7 @@ type MOFED struct {
 
 // Metrics represents spec to run metrics exporter
 type Metrics struct {
-	ctx        context.Context
-	kubeClient kubernetes.Interface
+	ctx context.Context
 }
 
 // VfioPCI represents spec to validate vfio-pci driver
@@ -98,6 +99,12 @@ type VGPUManager struct {
 // VGPUDevices represents spec to validate vGPU device creation
 type VGPUDevices struct {
 	ctx context.Context
+}
+
+// CCManager represents spec to validate CC Manager installation
+type CCManager struct {
+	ctx        context.Context
+	kubeClient kubernetes.Interface
 }
 
 var (
@@ -153,6 +160,8 @@ const (
 	hostVGPUManagerStatusFile = "host-vgpu-manager-ready"
 	// vGPUDevicesStatusFile is name of the file which indicates vGPU Manager is installed and vGPU devices have been created
 	vGPUDevicesStatusFile = "vgpu-devices-ready"
+	// ccManagerStatusFile indicates status file for cc-manager readiness
+	ccManagerStatusFile = "cc-manager-ready"
 	// workloadTypeStatusFile is the name of the file which specifies the workload type configured for the node
 	workloadTypeStatusFile = "workload-type"
 	// podCreationWaitRetries indicates total retries to wait for plugin validation pod creation
@@ -167,18 +176,12 @@ const (
 	genericGPUResourceType = "nvidia.com/gpu"
 	// migGPUResourcePrefix indicates the prefix of the MIG resources exposed by NVIDIA DevicePlugin
 	migGPUResourcePrefix = "nvidia.com/mig-"
-	// devicePluginEnvMigStrategy indicates the name of the DevicePlugin Env variable used to configure the MIG strategy
-	devicePluginEnvMigStrategy = "MIG_STRATEGY"
-	// migStrategyMixed indicates mixed MIG strategy
-	migStrategyMixed = "mixed"
 	// migStrategySingle indicates mixed MIG strategy
 	migStrategySingle = "single"
 	// pluginWorkloadPodSpecPath indicates path to plugin validation pod definition
 	pluginWorkloadPodSpecPath = "/var/nvidia/manifests/plugin-workload-validation.yaml"
 	// cudaWorkloadPodSpecPath indicates path to cuda validation pod definition
 	cudaWorkloadPodSpecPath = "/var/nvidia/manifests/cuda-workload-validation.yaml"
-	// NodeSelectorKey indicates node label key to use as node selector for plugin validation pod
-	nodeSelectorKey = "kubernetes.io/hostname"
 	// validatorImageEnvName indicates env name for validator image passed
 	validatorImageEnvName = "VALIDATOR_IMAGE"
 	// validatorImagePullPolicyEnvName indicates env name for validator image pull policy passed
@@ -202,12 +205,15 @@ const (
 	gpuWorkloadConfigContainer     = "container"
 	gpuWorkloadConfigVMPassthrough = "vm-passthrough"
 	gpuWorkloadConfigVMVgpu        = "vm-vgpu"
+	// CCCapableLabelKey represents NFD label name to indicate if the node is capable to run CC workloads
+	CCCapableLabelKey = "nvidia.com/cc.capable"
 )
 
 func main() {
 	c := cli.NewApp()
 	c.Before = validateFlags
 	c.Action = start
+	c.Version = info.GetVersionString()
 
 	c.Flags = []cli.Flag{
 		&cli.StringFlag{
@@ -244,7 +250,7 @@ func main() {
 		&cli.BoolFlag{
 			Name:        "with-workload",
 			Aliases:     []string{"l"},
-			Value:       false,
+			Value:       true,
 			Usage:       "indicates to validate with GPU workload",
 			Destination: &withWorkloadFlag,
 			EnvVars:     []string{"WITH_WORKLOAD"},
@@ -313,6 +319,9 @@ func main() {
 			EnvVars:     []string{"DISABLE_DEV_CHAR_SYMLINK_CREATION"},
 		},
 	}
+
+	// Log version info
+	log.Infof("version: %s", c.Version)
 
 	// Handle signals
 	go handleSignal()
@@ -388,6 +397,8 @@ func isValidComponent() bool {
 	case "vgpu-manager":
 		fallthrough
 	case "vgpu-devices":
+		fallthrough
+	case "cc-manager":
 		fallthrough
 	case "nvidia-fs":
 		return true
@@ -539,6 +550,15 @@ func start(c *cli.Context) error {
 			return fmt.Errorf("error validating vGPU devices: %s", err)
 		}
 		return nil
+	case "cc-manager":
+		CCManager := &CCManager{
+			ctx: c.Context,
+		}
+		err := CCManager.validate()
+		if err != nil {
+			return fmt.Errorf("error validating CC Manager installation: %s", err)
+		}
+		return nil
 	default:
 		return fmt.Errorf("invalid component specified for validation: %s", componentFlag)
 	}
@@ -571,16 +591,6 @@ func runCommandWithWait(command string, args []string, sleepSeconds int, silent 
 	}
 }
 
-func cleanupStatusFiles() error {
-	command := "rm"
-	args := []string{"-f", fmt.Sprintf("%s/*-ready", outputDirFlag)}
-	err := runCommand(command, args, false)
-	if err != nil {
-		return fmt.Errorf("unable to cleanup status files: %s", err)
-	}
-	return nil
-}
-
 func getDriverRoot() (string, bool) {
 	// check if driver is pre-installed on the host and use host path for validation
 	if fileInfo, err := os.Lstat("/host/usr/bin/nvidia-smi"); err == nil && fileInfo.Size() != 0 {
@@ -593,7 +603,7 @@ func getDriverRoot() (string, bool) {
 
 // For driver container installs, check existence of .driver-ctr-ready to confirm running driver
 // container has completed and is in Ready state.
-func assertDriverContainerReady(silent, withWaitFlag bool) error {
+func assertDriverContainerReady(silent bool) error {
 	command := "bash"
 	args := []string{"-c", "stat /run/nvidia/validations/.driver-ctr-ready"}
 
@@ -604,12 +614,12 @@ func assertDriverContainerReady(silent, withWaitFlag bool) error {
 	return runCommand(command, args, silent)
 }
 
-func (d *Driver) runValidation(silent bool) (bool, string, error) {
+func (d *Driver) runValidation(silent bool) (string, bool, error) {
 	driverRoot, isHostDriver := getDriverRoot()
 	if !isHostDriver {
 		log.Infof("Driver is not pre-installed on the host. Checking driver container status.")
-		if err := assertDriverContainerReady(silent, withWaitFlag); err != nil {
-			return false, "", fmt.Errorf("error checking driver container status: %v", err)
+		if err := assertDriverContainerReady(silent); err != nil {
+			return "", false, fmt.Errorf("error checking driver container status: %v", err)
 		}
 	}
 
@@ -618,10 +628,10 @@ func (d *Driver) runValidation(silent bool) (bool, string, error) {
 	args := []string{driverRoot, "nvidia-smi"}
 
 	if withWaitFlag {
-		return isHostDriver, driverRoot, runCommandWithWait(command, args, sleepIntervalSecondsFlag, silent)
+		return driverRoot, isHostDriver, runCommandWithWait(command, args, sleepIntervalSecondsFlag, silent)
 	}
 
-	return isHostDriver, driverRoot, runCommand(command, args, silent)
+	return driverRoot, isHostDriver, runCommand(command, args, silent)
 }
 
 func (d *Driver) validate() error {
@@ -637,7 +647,7 @@ func (d *Driver) validate() error {
 		return err
 	}
 
-	isHostDriver, driverRoot, err := d.runValidation(false)
+	driverRoot, isHostDriver, err := d.runValidation(false)
 	if err != nil {
 		log.Error("driver is not ready")
 		return err
@@ -645,7 +655,7 @@ func (d *Driver) validate() error {
 
 	if !disableDevCharSymlinkCreation {
 		log.Info("creating symlinks under /dev/char that correspond to NVIDIA character devices")
-		err = createDevCharSymlinks(isHostDriver, driverRoot)
+		err = createDevCharSymlinks(driverRoot, isHostDriver)
 		if err != nil {
 			msg := strings.Join([]string{
 				"Failed to create symlinks under /dev/char that point to all possible NVIDIA character devices.",
@@ -679,7 +689,7 @@ func (d *Driver) validate() error {
 }
 
 // createDevCharSymlinks creates symlinks in /host-dev-char that point to all possible NVIDIA devices nodes.
-func createDevCharSymlinks(isHostDriver bool, driverRoot string) error {
+func createDevCharSymlinks(driverRoot string, isHostDriver bool) error {
 	// If the host driver is being used, we rely on the fact that we are running a privileged container and as such
 	// have access to /dev
 	devRoot := driverRoot
@@ -762,7 +772,7 @@ func (n *NvidiaFs) validate() error {
 }
 
 func (n *NvidiaFs) runValidation(silent bool) error {
-	//check for nvidia_fs module to be loaded
+	// check for nvidia_fs module to be loaded
 	command := "bash"
 	args := []string{"-c", "lsmod | grep nvidia_fs"}
 
@@ -897,7 +907,7 @@ func (m *MOFED) validate() error {
 }
 
 func (m *MOFED) runValidation(silent bool) error {
-	//check for mlx5_core module to be loaded
+	// check for mlx5_core module to be loaded
 	command := "bash"
 	args := []string{"-c", "lsmod | grep mlx5_core"}
 
@@ -943,14 +953,14 @@ func (p *Plugin) runWorkload() error {
 
 	imagePullPolicy := os.Getenv(validatorImagePullPolicyEnvName)
 	if imagePullPolicy != "" {
-		pod.Spec.Containers[0].ImagePullPolicy = v1.PullPolicy(imagePullPolicy)
-		pod.Spec.InitContainers[0].ImagePullPolicy = v1.PullPolicy(imagePullPolicy)
+		pod.Spec.Containers[0].ImagePullPolicy = corev1.PullPolicy(imagePullPolicy)
+		pod.Spec.InitContainers[0].ImagePullPolicy = corev1.PullPolicy(imagePullPolicy)
 	}
 
 	if os.Getenv(validatorImagePullSecretsEnvName) != "" {
 		pullSecrets := strings.Split(os.Getenv(validatorImagePullSecretsEnvName), ",")
 		for _, secret := range pullSecrets {
-			pod.Spec.ImagePullSecrets = append(pod.Spec.ImagePullSecrets, v1.LocalObjectReference{Name: secret})
+			pod.Spec.ImagePullSecrets = append(pod.Spec.ImagePullSecrets, corev1.LocalObjectReference{Name: secret})
 		}
 	}
 	if os.Getenv(validatorRuntimeClassEnvName) != "" {
@@ -959,7 +969,10 @@ func (p *Plugin) runWorkload() error {
 	}
 
 	// update owner reference
-	setOwnerReference(ctx, p.kubeClient, pod)
+	err = setOwnerReference(ctx, p.kubeClient, pod)
+	if err != nil {
+		return fmt.Errorf("unable to set ownerReference for validator pod: %s", err)
+	}
 
 	// set pod tolerations
 	err = setTolerations(ctx, p.kubeClient, pod)
@@ -975,7 +988,7 @@ func (p *Plugin) runWorkload() error {
 		return err
 	}
 
-	gpuResource := v1.ResourceList{
+	gpuResource := corev1.ResourceList{
 		resourceName: resource.MustParse("1"),
 	}
 
@@ -1014,7 +1027,7 @@ func (p *Plugin) runWorkload() error {
 	return nil
 }
 
-func setOwnerReference(ctx context.Context, kubeClient kubernetes.Interface, pod *v1.Pod) error {
+func setOwnerReference(ctx context.Context, kubeClient kubernetes.Interface, pod *corev1.Pod) error {
 	// get owner of validator daemonset (which is ClusterPolicy)
 	validatorDaemonset, err := kubeClient.AppsV1().DaemonSets(namespaceFlag).Get(ctx, "nvidia-operator-validator", meta_v1.GetOptions{})
 	if err != nil {
@@ -1026,7 +1039,7 @@ func setOwnerReference(ctx context.Context, kubeClient kubernetes.Interface, pod
 	return nil
 }
 
-func setTolerations(ctx context.Context, kubeClient kubernetes.Interface, pod *v1.Pod) error {
+func setTolerations(ctx context.Context, kubeClient kubernetes.Interface, pod *corev1.Pod) error {
 	// get tolerations of validator daemonset
 	validatorDaemonset, err := kubeClient.AppsV1().DaemonSets(namespaceFlag).Get(ctx, "nvidia-operator-validator", meta_v1.GetOptions{})
 	if err != nil {
@@ -1058,15 +1071,15 @@ func waitForPod(ctx context.Context, kubeClient kubernetes.Interface, name strin
 	return fmt.Errorf("gave up waiting for pod %s to be available", name)
 }
 
-func loadPodSpec(podSpecPath string) (*v1.Pod, error) {
-	var pod v1.Pod
+func loadPodSpec(podSpecPath string) (*corev1.Pod, error) {
+	var pod corev1.Pod
 	manifest, err := os.ReadFile(podSpecPath)
 	if err != nil {
 		panic(err)
 	}
 	s := json.NewSerializerWithOptions(json.DefaultMetaFactory, scheme.Scheme,
 		scheme.Scheme, json.SerializerOptions{Yaml: true, Pretty: false, Strict: false})
-	reg, _ := regexp.Compile(`\b(\w*kind:\w*)\B.*\b`)
+	reg := regexp.MustCompile(`\b(\w*kind:\w*)\B.*\b`)
 
 	kind := reg.FindString(string(manifest))
 	slice := strings.Split(kind, ":")
@@ -1121,7 +1134,7 @@ func (p *Plugin) validateGPUResource() error {
 	return fmt.Errorf("GPU resources are not discovered by the node")
 }
 
-func (p *Plugin) availableMIGResourceName(resources v1.ResourceList) v1.ResourceName {
+func (p *Plugin) availableMIGResourceName(resources corev1.ResourceList) corev1.ResourceName {
 	for resourceName, quantity := range resources {
 		if strings.HasPrefix(string(resourceName), migGPUResourcePrefix) && quantity.Value() >= 1 {
 			log.Debugf("Found MIG GPU resource name %s quantity %d", resourceName, quantity.Value())
@@ -1131,7 +1144,7 @@ func (p *Plugin) availableMIGResourceName(resources v1.ResourceList) v1.Resource
 	return ""
 }
 
-func (p *Plugin) availableGenericResourceName(resources v1.ResourceList) v1.ResourceName {
+func (p *Plugin) availableGenericResourceName(resources corev1.ResourceList) corev1.ResourceName {
 	for resourceName, quantity := range resources {
 		if strings.HasPrefix(string(resourceName), genericGPUResourceType) && quantity.Value() >= 1 {
 			log.Debugf("Found GPU resource name %s quantity %d", resourceName, quantity.Value())
@@ -1141,7 +1154,7 @@ func (p *Plugin) availableGenericResourceName(resources v1.ResourceList) v1.Reso
 	return ""
 }
 
-func (p *Plugin) getGPUResourceName() (v1.ResourceName, error) {
+func (p *Plugin) getGPUResourceName() (corev1.ResourceName, error) {
 	// get node info to check allocatable GPU resources
 	node, err := getNode(p.ctx, p.kubeClient)
 	if err != nil {
@@ -1164,7 +1177,7 @@ func (p *Plugin) setKubeClient(kubeClient kubernetes.Interface) {
 	p.kubeClient = kubeClient
 }
 
-func getNode(ctx context.Context, kubeClient kubernetes.Interface) (*v1.Node, error) {
+func getNode(ctx context.Context, kubeClient kubernetes.Interface) (*corev1.Node, error) {
 	node, err := kubeClient.CoreV1().Nodes().Get(ctx, nodeNameFlag, meta_v1.GetOptions{})
 	if err != nil {
 		log.Errorf("unable to get node with name %s, err %s", nodeNameFlag, err.Error())
@@ -1196,10 +1209,12 @@ func (c *CUDA) validate() error {
 	// update k8s client for the plugin
 	c.setKubeClient(kubeClient)
 
-	// workload test
-	err = c.runWorkload()
-	if err != nil {
-		return err
+	if withWorkloadFlag {
+		// workload test
+		err = c.runWorkload()
+		if err != nil {
+			return err
+		}
 	}
 
 	// create plugin status file
@@ -1229,14 +1244,14 @@ func (c *CUDA) runWorkload() error {
 
 	imagePullPolicy := os.Getenv(validatorImagePullPolicyEnvName)
 	if imagePullPolicy != "" {
-		pod.Spec.Containers[0].ImagePullPolicy = v1.PullPolicy(imagePullPolicy)
-		pod.Spec.InitContainers[0].ImagePullPolicy = v1.PullPolicy(imagePullPolicy)
+		pod.Spec.Containers[0].ImagePullPolicy = corev1.PullPolicy(imagePullPolicy)
+		pod.Spec.InitContainers[0].ImagePullPolicy = corev1.PullPolicy(imagePullPolicy)
 	}
 
 	if os.Getenv(validatorImagePullSecretsEnvName) != "" {
 		pullSecrets := strings.Split(os.Getenv(validatorImagePullSecretsEnvName), ",")
 		for _, secret := range pullSecrets {
-			pod.Spec.ImagePullSecrets = append(pod.Spec.ImagePullSecrets, v1.LocalObjectReference{Name: secret})
+			pod.Spec.ImagePullSecrets = append(pod.Spec.ImagePullSecrets, corev1.LocalObjectReference{Name: secret})
 		}
 	}
 	if os.Getenv(validatorRuntimeClassEnvName) != "" {
@@ -1423,6 +1438,78 @@ func (v *VGPUManager) runValidation(silent bool) (hostDriver bool, err error) {
 	}
 
 	return hostDriver, runCommand(command, args, silent)
+}
+
+func (c *CCManager) validate() error {
+	// delete status file if already present
+	err := deleteStatusFile(outputDirFlag + "/" + ccManagerStatusFile)
+	if err != nil {
+		return err
+	}
+
+	kubeConfig, err := rest.InClusterConfig()
+	if err != nil {
+		return fmt.Errorf("Error getting cluster config - %s", err.Error())
+	}
+
+	kubeClient, err := kubernetes.NewForConfig(kubeConfig)
+	if err != nil {
+		log.Errorf("Error getting k8s client - %s\n", err.Error())
+		return err
+	}
+
+	// update k8s client for fetching node labels
+	c.setKubeClient(kubeClient)
+
+	err = c.runValidation(false)
+	if err != nil {
+		fmt.Println("CC Manager is not ready")
+		return err
+	}
+
+	// create driver status file
+	err = createStatusFile(outputDirFlag + "/" + ccManagerStatusFile)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *CCManager) runValidation(silent bool) error {
+	node, err := getNode(c.ctx, c.kubeClient)
+	if err != nil {
+		return fmt.Errorf("unable to fetch node by name %s to check for %s label: %s", nodeNameFlag, CCCapableLabelKey, err)
+	}
+
+	// make sure this is a CC capable node
+	nodeLabels := node.GetLabels()
+	if enabled, ok := nodeLabels[CCCapableLabelKey]; !ok || enabled != "true" {
+		log.Info("Not a CC capable node, skipping CC Manager validation")
+		return nil
+	}
+
+	// check if the ccManager container is ready
+	err = assertCCManagerContainerReady(silent, withWaitFlag)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *CCManager) setKubeClient(kubeClient kubernetes.Interface) {
+	c.kubeClient = kubeClient
+}
+
+// Check that the ccManager container is ready after applying required ccMode
+func assertCCManagerContainerReady(silent, withWaitFlag bool) error {
+	command := "bash"
+	args := []string{"-c", "stat /run/nvidia/validations/.cc-manager-ctr-ready"}
+
+	if withWaitFlag {
+		return runCommandWithWait(command, args, sleepIntervalSecondsFlag, silent)
+	}
+
+	return runCommand(command, args, silent)
 }
 
 func (v *VGPUDevices) validate() error {

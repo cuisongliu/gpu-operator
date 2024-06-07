@@ -1,9 +1,27 @@
+/**
+# Copyright (c) NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+**/
+
 package controllers
 
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path"
 	"regexp"
@@ -13,28 +31,28 @@ import (
 
 	"path/filepath"
 
-	gpuv1 "github.com/NVIDIA/gpu-operator/api/v1"
+	"github.com/davecgh/go-spew/spew"
 	"github.com/mitchellh/hashstructure"
 	apiconfigv1 "github.com/openshift/api/config/v1"
 	apiimagev1 "github.com/openshift/api/image/v1"
 	secv1 "github.com/openshift/api/security/v1"
 	promv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"golang.org/x/mod/semver"
-	"gopkg.in/yaml.v2"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
 	nodev1 "k8s.io/api/node/v1"
 	nodev1beta1 "k8s.io/api/node/v1beta1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/yaml"
+
+	gpuv1 "github.com/NVIDIA/gpu-operator/api/nvidia/v1"
 )
 
 const (
@@ -94,8 +112,8 @@ const (
 	MigDefaultGPUClientsConfigMapName = "default-gpu-clients"
 	// DCGMRemoteEngineEnvName indicates env name to specify remote DCGM host engine ip:port
 	DCGMRemoteEngineEnvName = "DCGM_REMOTE_HOSTENGINE_INFO"
-	// DCGMDefaultHostPort indicates default host port bound to DCGM host engine
-	DCGMDefaultHostPort = 5555
+	// DCGMDefaultPort indicates default port bound to DCGM host engine
+	DCGMDefaultPort = 5555
 	// GPUDirectRDMAEnabledEnvName indicates if GPU direct RDMA is enabled through GPU operator
 	GPUDirectRDMAEnabledEnvName = "GPU_DIRECT_RDMA_ENABLED"
 	// UseHostMOFEDEnvName indicates if MOFED driver is pre-installed on the host
@@ -142,6 +160,14 @@ const (
 	DefaultKataArtifactsDir = "/opt/nvidia-gpu-operator/artifacts/runtimeclasses/"
 	// PodControllerRevisionHashLabelKey is the annotation key for pod controller revision hash value
 	PodControllerRevisionHashLabelKey = "controller-revision-hash"
+	// DefaultCCModeEnvName is the name of the envvar for configuring default CC mode on all compatible GPUs on the node
+	DefaultCCModeEnvName = "DEFAULT_CC_MODE"
+	// OpenKernelModulesEnabledEnvName is the name of the driver-container envvar for enabling open GPU kernel module support
+	OpenKernelModulesEnabledEnvName = "OPEN_KERNEL_MODULES_ENABLED"
+	// MPSRootEnvName is the name of the envvar for configuring the MPS root
+	MPSRootEnvName = "MPS_ROOT"
+	// DefaultMPSRoot is the default MPS root path on the host
+	DefaultMPSRoot = "/run/nvidia/mps"
 )
 
 // ContainerProbe defines container probe types
@@ -254,24 +280,24 @@ func ServiceAccount(n ClusterPolicyController) (gpuv1.State, error) {
 	obj := n.resources[state].ServiceAccount.DeepCopy()
 	obj.Namespace = n.operatorNamespace
 
-	logger := n.rec.Log.WithValues("ServiceAccount", obj.Name, "Namespace", obj.Namespace)
+	logger := n.logger.WithValues("ServiceAccount", obj.Name, "Namespace", obj.Namespace)
 
 	// Check if state is disabled and cleanup resource if exists
 	if !n.isStateEnabled(n.stateNames[n.idx]) {
-		err := n.rec.Client.Delete(ctx, obj)
-		if err != nil && !errors.IsNotFound(err) {
+		err := n.client.Delete(ctx, obj)
+		if err != nil && !apierrors.IsNotFound(err) {
 			logger.Info("Couldn't delete", "Error", err)
 			return gpuv1.NotReady, err
 		}
 		return gpuv1.Disabled, nil
 	}
 
-	if err := controllerutil.SetControllerReference(n.singleton, obj, n.rec.Scheme); err != nil {
+	if err := controllerutil.SetControllerReference(n.singleton, obj, n.scheme); err != nil {
 		return gpuv1.NotReady, err
 	}
 
-	if err := n.rec.Client.Create(ctx, obj); err != nil {
-		if errors.IsAlreadyExists(err) {
+	if err := n.client.Create(ctx, obj); err != nil {
+		if apierrors.IsAlreadyExists(err) {
 			logger.Info("Found Resource, skipping update")
 			return gpuv1.Ready, nil
 		}
@@ -289,26 +315,26 @@ func Role(n ClusterPolicyController) (gpuv1.State, error) {
 	obj := n.resources[state].Role.DeepCopy()
 	obj.Namespace = n.operatorNamespace
 
-	logger := n.rec.Log.WithValues("Role", obj.Name, "Namespace", obj.Namespace)
+	logger := n.logger.WithValues("Role", obj.Name, "Namespace", obj.Namespace)
 
 	// Check if state is disabled and cleanup resource if exists
 	if !n.isStateEnabled(n.stateNames[n.idx]) {
-		err := n.rec.Client.Delete(ctx, obj)
-		if err != nil && !errors.IsNotFound(err) {
+		err := n.client.Delete(ctx, obj)
+		if err != nil && !apierrors.IsNotFound(err) {
 			logger.Info("Couldn't delete", "Error", err)
 			return gpuv1.NotReady, err
 		}
 		return gpuv1.Disabled, nil
 	}
 
-	if err := controllerutil.SetControllerReference(n.singleton, obj, n.rec.Scheme); err != nil {
+	if err := controllerutil.SetControllerReference(n.singleton, obj, n.scheme); err != nil {
 		return gpuv1.NotReady, err
 	}
 
-	if err := n.rec.Client.Create(ctx, obj); err != nil {
-		if errors.IsAlreadyExists(err) {
+	if err := n.client.Create(ctx, obj); err != nil {
+		if apierrors.IsAlreadyExists(err) {
 			logger.Info("Found Resource, updating...")
-			err = n.rec.Client.Update(ctx, obj)
+			err = n.client.Update(ctx, obj)
 			if err != nil {
 				logger.Info("Couldn't update", "Error", err)
 				return gpuv1.NotReady, err
@@ -330,12 +356,12 @@ func RoleBinding(n ClusterPolicyController) (gpuv1.State, error) {
 	obj := n.resources[state].RoleBinding.DeepCopy()
 	obj.Namespace = n.operatorNamespace
 
-	logger := n.rec.Log.WithValues("RoleBinding", obj.Name, "Namespace", obj.Namespace)
+	logger := n.logger.WithValues("RoleBinding", obj.Name, "Namespace", obj.Namespace)
 
 	// Check if state is disabled and cleanup resource if exists
 	if !n.isStateEnabled(n.stateNames[n.idx]) {
-		err := n.rec.Client.Delete(ctx, obj)
-		if err != nil && !errors.IsNotFound(err) {
+		err := n.client.Delete(ctx, obj)
+		if err != nil && !apierrors.IsNotFound(err) {
 			logger.Info("Couldn't delete", "Error", err)
 			return gpuv1.NotReady, err
 		}
@@ -352,14 +378,14 @@ func RoleBinding(n ClusterPolicyController) (gpuv1.State, error) {
 		obj.Subjects[idx].Namespace = n.operatorNamespace
 	}
 
-	if err := controllerutil.SetControllerReference(n.singleton, obj, n.rec.Scheme); err != nil {
+	if err := controllerutil.SetControllerReference(n.singleton, obj, n.scheme); err != nil {
 		return gpuv1.NotReady, err
 	}
 
-	if err := n.rec.Client.Create(ctx, obj); err != nil {
-		if errors.IsAlreadyExists(err) {
+	if err := n.client.Create(ctx, obj); err != nil {
+		if apierrors.IsAlreadyExists(err) {
 			logger.Info("Found Resource, updating...")
-			err = n.rec.Client.Update(ctx, obj)
+			err = n.client.Update(ctx, obj)
 			if err != nil {
 				logger.Info("Couldn't update", "Error", err)
 				return gpuv1.NotReady, err
@@ -381,26 +407,26 @@ func ClusterRole(n ClusterPolicyController) (gpuv1.State, error) {
 	obj := n.resources[state].ClusterRole.DeepCopy()
 	obj.Namespace = n.operatorNamespace
 
-	logger := n.rec.Log.WithValues("ClusterRole", obj.Name, "Namespace", obj.Namespace)
+	logger := n.logger.WithValues("ClusterRole", obj.Name, "Namespace", obj.Namespace)
 
 	// Check if state is disabled and cleanup resource if exists
 	if !n.isStateEnabled(n.stateNames[n.idx]) {
-		err := n.rec.Client.Delete(ctx, obj)
-		if err != nil && !errors.IsNotFound(err) {
+		err := n.client.Delete(ctx, obj)
+		if err != nil && !apierrors.IsNotFound(err) {
 			logger.Info("Couldn't delete", "Error", err)
 			return gpuv1.NotReady, err
 		}
 		return gpuv1.Disabled, nil
 	}
 
-	if err := controllerutil.SetControllerReference(n.singleton, obj, n.rec.Scheme); err != nil {
+	if err := controllerutil.SetControllerReference(n.singleton, obj, n.scheme); err != nil {
 		return gpuv1.NotReady, err
 	}
 
-	if err := n.rec.Client.Create(ctx, obj); err != nil {
-		if errors.IsAlreadyExists(err) {
+	if err := n.client.Create(ctx, obj); err != nil {
+		if apierrors.IsAlreadyExists(err) {
 			logger.Info("Found Resource, updating...")
-			err = n.rec.Client.Update(ctx, obj)
+			err = n.client.Update(ctx, obj)
 			if err != nil {
 				logger.Info("Couldn't update", "Error", err)
 				return gpuv1.NotReady, err
@@ -422,12 +448,12 @@ func ClusterRoleBinding(n ClusterPolicyController) (gpuv1.State, error) {
 	obj := n.resources[state].ClusterRoleBinding.DeepCopy()
 	obj.Namespace = n.operatorNamespace
 
-	logger := n.rec.Log.WithValues("ClusterRoleBinding", obj.Name, "Namespace", obj.Namespace)
+	logger := n.logger.WithValues("ClusterRoleBinding", obj.Name, "Namespace", obj.Namespace)
 
 	// Check if state is disabled and cleanup resource if exists
 	if !n.isStateEnabled(n.stateNames[n.idx]) {
-		err := n.rec.Client.Delete(ctx, obj)
-		if err != nil && !errors.IsNotFound(err) {
+		err := n.client.Delete(ctx, obj)
+		if err != nil && !apierrors.IsNotFound(err) {
 			logger.Info("Couldn't delete", "Error", err)
 			return gpuv1.NotReady, err
 		}
@@ -438,14 +464,14 @@ func ClusterRoleBinding(n ClusterPolicyController) (gpuv1.State, error) {
 		obj.Subjects[idx].Namespace = n.operatorNamespace
 	}
 
-	if err := controllerutil.SetControllerReference(n.singleton, obj, n.rec.Scheme); err != nil {
+	if err := controllerutil.SetControllerReference(n.singleton, obj, n.scheme); err != nil {
 		return gpuv1.NotReady, err
 	}
 
-	if err := n.rec.Client.Create(ctx, obj); err != nil {
-		if errors.IsAlreadyExists(err) {
+	if err := n.client.Create(ctx, obj); err != nil {
+		if apierrors.IsAlreadyExists(err) {
 			logger.Info("Found Resource, updating...")
-			err = n.rec.Client.Update(ctx, obj)
+			err = n.client.Update(ctx, obj)
 			if err != nil {
 				logger.Info("Couldn't update", "Error", err)
 				return gpuv1.NotReady, err
@@ -468,12 +494,12 @@ func createConfigMap(n ClusterPolicyController, configMapIdx int) (gpuv1.State, 
 	obj := n.resources[state].ConfigMaps[configMapIdx].DeepCopy()
 	obj.Namespace = n.operatorNamespace
 
-	logger := n.rec.Log.WithValues("ConfigMap", obj.Name, "Namespace", obj.Namespace)
+	logger := n.logger.WithValues("ConfigMap", obj.Name, "Namespace", obj.Namespace)
 
 	// Check if state is disabled and cleanup resource if exists
 	if !n.isStateEnabled(n.stateNames[n.idx]) {
-		err := n.rec.Client.Delete(ctx, obj)
-		if err != nil && !errors.IsNotFound(err) {
+		err := n.client.Delete(ctx, obj)
+		if err != nil && !apierrors.IsNotFound(err) {
 			logger.Info("Couldn't delete", "Error", err)
 			return gpuv1.NotReady, err
 		}
@@ -514,18 +540,18 @@ func createConfigMap(n ClusterPolicyController, configMapIdx int) (gpuv1.State, 
 		}
 	}
 
-	if err := controllerutil.SetControllerReference(n.singleton, obj, n.rec.Scheme); err != nil {
+	if err := controllerutil.SetControllerReference(n.singleton, obj, n.scheme); err != nil {
 		return gpuv1.NotReady, err
 	}
 
-	if err := n.rec.Client.Create(ctx, obj); err != nil {
-		if !errors.IsAlreadyExists(err) {
+	if err := n.client.Create(ctx, obj); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
 			logger.Info("Couldn't create", "Error", err)
 			return gpuv1.NotReady, err
 		}
 
 		logger.Info("Found Resource, updating...")
-		err = n.rec.Client.Update(ctx, obj)
+		err = n.client.Update(ctx, obj)
 		if err != nil {
 			logger.Info("Couldn't update", "Error", err)
 			return gpuv1.NotReady, err
@@ -555,7 +581,7 @@ func ConfigMaps(n ClusterPolicyController) (gpuv1.State, error) {
 func (n ClusterPolicyController) getKernelVersionsMap() (map[string]string, error) {
 	kernelVersionMap := make(map[string]string)
 	ctx := n.ctx
-	logger := n.rec.Log.WithValues("Request.Namespace", "default", "Request.Name", "Node")
+	logger := n.logger.WithValues("Request.Namespace", "default", "Request.Name", "Node")
 
 	// Filter only GPU nodes
 	opts := []client.ListOption{
@@ -563,7 +589,7 @@ func (n ClusterPolicyController) getKernelVersionsMap() (map[string]string, erro
 	}
 
 	list := &corev1.NodeList{}
-	err := n.rec.Client.List(ctx, list, opts...)
+	err := n.client.List(ctx, list, opts...)
 	if err != nil {
 		logger.Info("Could not get NodeList", "ERROR", err)
 		return nil, err
@@ -592,7 +618,7 @@ func (n ClusterPolicyController) getKernelVersionsMap() (map[string]string, erro
 			// add mapping for "kernelVersion" --> "OS"
 			kernelVersionMap[kernelVersion] = nodeOS
 		} else {
-			err := errors.NewNotFound(schema.GroupResource{Group: "Node", Resource: "Label"}, nfdKernelLabelKey)
+			err := apierrors.NewNotFound(schema.GroupResource{Group: "Node", Resource: "Label"}, nfdKernelLabelKey)
 			logger.Error(err, "Failed to get kernel version of GPU node using Node Feature Discovery (NFD) labels. Is NFD installed in the cluster?")
 			return nil, err
 		}
@@ -603,14 +629,14 @@ func (n ClusterPolicyController) getKernelVersionsMap() (map[string]string, erro
 
 func kernelFullVersion(n ClusterPolicyController) (string, string, string) {
 	ctx := n.ctx
-	logger := n.rec.Log.WithValues("Request.Namespace", "default", "Request.Name", "Node")
+	logger := n.logger.WithValues("Request.Namespace", "default", "Request.Name", "Node")
 	// We need the node labels to fetch the correct container
 	opts := []client.ListOption{
 		client.MatchingLabels{"nvidia.com/gpu.present": "true"},
 	}
 
 	list := &corev1.NodeList{}
-	err := n.rec.Client.List(ctx, list, opts...)
+	err := n.client.List(ctx, list, opts...)
 	if err != nil {
 		logger.Info("Could not get NodeList", "ERROR", err)
 		return "", "", ""
@@ -633,7 +659,7 @@ func kernelFullVersion(n ClusterPolicyController) (string, string, string) {
 	if ok {
 		logger.Info(kFVersion)
 	} else {
-		err := errors.NewNotFound(schema.GroupResource{Group: "Node", Resource: "Label"}, nfdKernelLabelKey)
+		err := apierrors.NewNotFound(schema.GroupResource{Group: "Node", Resource: "Label"}, nfdKernelLabelKey)
 		logger.Info("Couldn't get kernelVersion, did you run the node feature discovery?", "Error", err)
 		return "", "", ""
 	}
@@ -652,23 +678,25 @@ func kernelFullVersion(n ClusterPolicyController) (string, string, string) {
 }
 
 func preProcessDaemonSet(obj *appsv1.DaemonSet, n ClusterPolicyController) error {
-	logger := n.rec.Log.WithValues("Daemonset", obj.Name)
+	logger := n.logger.WithValues("Daemonset", obj.Name)
 	transformations := map[string]func(*appsv1.DaemonSet, *gpuv1.ClusterPolicySpec, ClusterPolicyController) error{
-		"nvidia-driver-daemonset":                TransformDriver,
-		"nvidia-vgpu-manager-daemonset":          TransformVGPUManager,
-		"nvidia-vgpu-device-manager":             TransformVGPUDeviceManager,
-		"nvidia-vfio-manager":                    TransformVFIOManager,
-		"nvidia-container-toolkit-daemonset":     TransformToolkit,
-		"nvidia-device-plugin-daemonset":         TransformDevicePlugin,
-		"nvidia-sandbox-device-plugin-daemonset": TransformSandboxDevicePlugin,
-		"nvidia-dcgm":                            TransformDCGM,
-		"nvidia-dcgm-exporter":                   TransformDCGMExporter,
-		"nvidia-node-status-exporter":            TransformNodeStatusExporter,
-		"gpu-feature-discovery":                  TransformGPUDiscoveryPlugin,
-		"nvidia-mig-manager":                     TransformMIGManager,
-		"nvidia-operator-validator":              TransformValidator,
-		"nvidia-sandbox-validator":               TransformSandboxValidator,
-		"nvidia-kata-manager":                    TransformKataManager,
+		"nvidia-driver-daemonset":                 TransformDriver,
+		"nvidia-vgpu-manager-daemonset":           TransformVGPUManager,
+		"nvidia-vgpu-device-manager":              TransformVGPUDeviceManager,
+		"nvidia-vfio-manager":                     TransformVFIOManager,
+		"nvidia-container-toolkit-daemonset":      TransformToolkit,
+		"nvidia-device-plugin-daemonset":          TransformDevicePlugin,
+		"nvidia-device-plugin-mps-control-daemon": TransformMPSControlDaemon,
+		"nvidia-sandbox-device-plugin-daemonset":  TransformSandboxDevicePlugin,
+		"nvidia-dcgm":                             TransformDCGM,
+		"nvidia-dcgm-exporter":                    TransformDCGMExporter,
+		"nvidia-node-status-exporter":             TransformNodeStatusExporter,
+		"gpu-feature-discovery":                   TransformGPUDiscoveryPlugin,
+		"nvidia-mig-manager":                      TransformMIGManager,
+		"nvidia-operator-validator":               TransformValidator,
+		"nvidia-sandbox-validator":                TransformSandboxValidator,
+		"nvidia-kata-manager":                     TransformKataManager,
+		"nvidia-cc-manager":                       TransformCCManager,
 	}
 
 	t, ok := transformations[obj.Name]
@@ -765,9 +793,7 @@ func TransformGPUDiscoveryPlugin(obj *appsv1.DaemonSet, config *gpuv1.ClusterPol
 
 	// set image pull secrets
 	if len(config.GPUFeatureDiscovery.ImagePullSecrets) > 0 {
-		for _, secret := range config.GPUFeatureDiscovery.ImagePullSecrets {
-			obj.Spec.Template.Spec.ImagePullSecrets = append(obj.Spec.Template.Spec.ImagePullSecrets, v1.LocalObjectReference{Name: secret})
-		}
+		addPullSecrets(&obj.Spec.Template.Spec, config.GPUFeatureDiscovery.ImagePullSecrets)
 	}
 
 	// set resource limits
@@ -842,7 +868,7 @@ func TransformDriver(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec, n C
 	}
 
 	// update driver-manager initContainer
-	err = transformDriverManagerInitContainer(obj, &config.Driver.Manager)
+	err = transformDriverManagerInitContainer(obj, &config.Driver.Manager, config.Driver.GPUDirectRDMA)
 	if err != nil {
 		return err
 	}
@@ -861,6 +887,12 @@ func TransformDriver(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec, n C
 
 	// update nvidia-fs sidecar container
 	err = transformGDSContainer(obj, config, n)
+	if err != nil {
+		return err
+	}
+
+	// updated nvidia-gdrcopy sidecar container
+	err = transformGDRCopyContainer(obj, config, n)
 	if err != nil {
 		return err
 	}
@@ -884,7 +916,7 @@ func TransformDriver(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec, n C
 // TransformVGPUManager transforms NVIDIA vGPU Manager daemonset with required config as per ClusterPolicy
 func TransformVGPUManager(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec, n ClusterPolicyController) error {
 	// update k8s-driver-manager initContainer
-	err := transformDriverManagerInitContainer(obj, &config.VGPUManager.DriverManager)
+	err := transformDriverManagerInitContainer(obj, &config.VGPUManager.DriverManager, nil)
 	if err != nil {
 		return fmt.Errorf("failed to transform k8s-driver-manager initContainer for vGPU Manager: %v", err)
 	}
@@ -947,14 +979,14 @@ func applyOCPProxySpec(n ClusterPolicyController, podSpec *corev1.PodSpec) error
 				MountPath: TrustedCABundleMountDir,
 			})
 		podSpec.Volumes = append(podSpec.Volumes,
-			v1.Volume{
+			corev1.Volume{
 				Name: TrustedCAConfigMapName,
 				VolumeSource: corev1.VolumeSource{
 					ConfigMap: &corev1.ConfigMapVolumeSource{
-						LocalObjectReference: v1.LocalObjectReference{
+						LocalObjectReference: corev1.LocalObjectReference{
 							Name: TrustedCAConfigMapName,
 						},
-						Items: []v1.KeyToPath{
+						Items: []corev1.KeyToPath{
 							{
 								Key:  TrustedCABundleFileName,
 								Path: TrustedCACertificate,
@@ -988,17 +1020,17 @@ func getOrCreateTrustedCAConfigMap(n ClusterPolicyController, name string) (*cor
 	configMap.ObjectMeta.Labels = make(map[string]string)
 	configMap.ObjectMeta.Labels["config.openshift.io/inject-trusted-cabundle"] = "true"
 
-	logger := n.rec.Log.WithValues("ConfigMap", configMap.ObjectMeta.Name, "Namespace", configMap.ObjectMeta.Namespace)
+	logger := n.logger.WithValues("ConfigMap", configMap.ObjectMeta.Name, "Namespace", configMap.ObjectMeta.Namespace)
 
-	if err := controllerutil.SetControllerReference(n.singleton, configMap, n.rec.Scheme); err != nil {
+	if err := controllerutil.SetControllerReference(n.singleton, configMap, n.scheme); err != nil {
 		return nil, err
 	}
 
 	found := &corev1.ConfigMap{}
-	err := n.rec.Client.Get(ctx, types.NamespacedName{Namespace: configMap.ObjectMeta.Namespace, Name: configMap.ObjectMeta.Name}, found)
-	if err != nil && errors.IsNotFound(err) {
+	err := n.client.Get(ctx, types.NamespacedName{Namespace: configMap.ObjectMeta.Namespace, Name: configMap.ObjectMeta.Name}, found)
+	if err != nil && apierrors.IsNotFound(err) {
 		logger.Info("Not found, creating")
-		err = n.rec.Client.Create(ctx, configMap)
+		err = n.client.Create(ctx, configMap)
 		if err != nil {
 			logger.Info("Couldn't create")
 			return nil, fmt.Errorf("failed to create trusted CA bundle config map %q: %s", name, err)
@@ -1012,8 +1044,8 @@ func getOrCreateTrustedCAConfigMap(n ClusterPolicyController, name string) (*cor
 }
 
 // get proxy env variables from cluster wide proxy in OCP
-func getProxyEnv(proxyConfig *apiconfigv1.Proxy) []v1.EnvVar {
-	envVars := []v1.EnvVar{}
+func getProxyEnv(proxyConfig *apiconfigv1.Proxy) []corev1.EnvVar {
+	envVars := []corev1.EnvVar{}
 	if proxyConfig == nil {
 		return envVars
 	}
@@ -1034,11 +1066,11 @@ func getProxyEnv(proxyConfig *apiconfigv1.Proxy) []v1.EnvVar {
 		if len(v) == 0 {
 			continue
 		}
-		upperCaseEnvvar := v1.EnvVar{
+		upperCaseEnvvar := corev1.EnvVar{
 			Name:  strings.ToUpper(e),
 			Value: v,
 		}
-		lowerCaseEnvvar := v1.EnvVar{
+		lowerCaseEnvvar := corev1.EnvVar{
 			Name:  strings.ToLower(e),
 			Value: v,
 		}
@@ -1067,10 +1099,9 @@ func TransformToolkit(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec, n 
 
 	// set image pull secrets
 	if len(config.Toolkit.ImagePullSecrets) > 0 {
-		for _, secret := range config.Toolkit.ImagePullSecrets {
-			obj.Spec.Template.Spec.ImagePullSecrets = append(obj.Spec.Template.Spec.ImagePullSecrets, v1.LocalObjectReference{Name: secret})
-		}
+		addPullSecrets(&obj.Spec.Template.Spec, config.Toolkit.ImagePullSecrets)
 	}
+
 	// set resource limits
 	if config.Toolkit.Resources != nil {
 		// apply resource limits to all containers
@@ -1132,13 +1163,15 @@ func TransformToolkit(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec, n 
 	sourceConfigFileName := path.Base(runtimeConfigFile)
 
 	var configEnvvarName string
-	if runtime == gpuv1.Containerd.String() {
+	switch runtime {
+	case gpuv1.Containerd.String():
 		configEnvvarName = "CONTAINERD_CONFIG"
-	} else if runtime == gpuv1.Docker.String() {
+	case gpuv1.Docker.String():
 		configEnvvarName = "DOCKER_CONFIG"
-	} else if runtime == gpuv1.CRIO.String() {
+	case gpuv1.CRIO.String():
 		configEnvvarName = "CRIO_CONFIG"
 	}
+
 	setContainerEnv(&(obj.Spec.Template.Spec.Containers[0]), configEnvvarName, DefaultRuntimeConfigTargetDir+sourceConfigFileName)
 
 	volMountConfigName := fmt.Sprintf("%s-config", runtime)
@@ -1200,12 +1233,12 @@ func TransformDevicePlugin(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpe
 
 	// update image pull policy
 	obj.Spec.Template.Spec.Containers[0].ImagePullPolicy = gpuv1.ImagePullPolicy(config.DevicePlugin.ImagePullPolicy)
+
 	// set image pull secrets
 	if len(config.DevicePlugin.ImagePullSecrets) > 0 {
-		for _, secret := range config.DevicePlugin.ImagePullSecrets {
-			obj.Spec.Template.Spec.ImagePullSecrets = append(obj.Spec.Template.Spec.ImagePullSecrets, v1.LocalObjectReference{Name: secret})
-		}
+		addPullSecrets(&obj.Spec.Template.Spec, config.DevicePlugin.ImagePullSecrets)
 	}
+
 	// set resource limits
 	if config.DevicePlugin.Resources != nil {
 		// apply resource limits to all containers
@@ -1252,6 +1285,96 @@ func TransformDevicePlugin(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpe
 		}
 	}
 
+	// update MPS volumes and set MPS_ROOT env var if a custom MPS root is configured
+	if config.DevicePlugin.MPS != nil && config.DevicePlugin.MPS.Root != "" &&
+		config.DevicePlugin.MPS.Root != DefaultMPSRoot {
+		for i, volume := range obj.Spec.Template.Spec.Volumes {
+			if volume.Name == "mps-root" {
+				obj.Spec.Template.Spec.Volumes[i].HostPath.Path = config.DevicePlugin.MPS.Root
+			} else if volume.Name == "mps-shm" {
+				obj.Spec.Template.Spec.Volumes[i].HostPath.Path = filepath.Join(config.DevicePlugin.MPS.Root, "shm")
+			}
+		}
+		setContainerEnv(&(obj.Spec.Template.Spec.Containers[0]), MPSRootEnvName, config.DevicePlugin.MPS.Root)
+	}
+
+	return nil
+}
+
+func TransformMPSControlDaemon(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec, n ClusterPolicyController) error {
+	// update validation container
+	err := transformValidationInitContainer(obj, config)
+	if err != nil {
+		return err
+	}
+
+	image, err := gpuv1.ImagePath(&config.DevicePlugin)
+	if err != nil {
+		return err
+	}
+	imagePullPolicy := gpuv1.ImagePullPolicy(config.DevicePlugin.ImagePullPolicy)
+
+	// update image path and imagePullPolicy for 'mps-control-daemon-mounts' initContainer
+	for i, initCtr := range obj.Spec.Template.Spec.InitContainers {
+		if initCtr.Name == "mps-control-daemon-mounts" {
+			obj.Spec.Template.Spec.InitContainers[i].Image = image
+			obj.Spec.Template.Spec.InitContainers[i].ImagePullPolicy = imagePullPolicy
+			break
+		}
+	}
+
+	// update image path and imagePullPolicy for main container
+	var mainContainer *corev1.Container
+	for i, ctr := range obj.Spec.Template.Spec.Containers {
+		if ctr.Name == "mps-control-daemon-ctr" {
+			mainContainer = &obj.Spec.Template.Spec.Containers[i]
+			break
+		}
+	}
+	if mainContainer == nil {
+		return fmt.Errorf("failed to find main container 'mps-control-daemon-ctr'")
+	}
+	mainContainer.Image = image
+	mainContainer.ImagePullPolicy = imagePullPolicy
+
+	// set image pull secrets
+	if len(config.DevicePlugin.ImagePullSecrets) > 0 {
+		addPullSecrets(&obj.Spec.Template.Spec, config.DevicePlugin.ImagePullSecrets)
+	}
+
+	// set resource limits
+	if config.DevicePlugin.Resources != nil {
+		// apply resource limits to all containers
+		for i := range obj.Spec.Template.Spec.Containers {
+			obj.Spec.Template.Spec.Containers[i].Resources.Requests = config.DevicePlugin.Resources.Requests
+			obj.Spec.Template.Spec.Containers[i].Resources.Limits = config.DevicePlugin.Resources.Limits
+		}
+	}
+
+	// apply plugin configuration through ConfigMap if one is provided
+	err = handleDevicePluginConfig(obj, config)
+	if err != nil {
+		return nil
+	}
+
+	// set RuntimeClass for supported runtimes
+	setRuntimeClass(&obj.Spec.Template.Spec, n.runtime, config.Operator.RuntimeClass)
+
+	// update env required for MIG support
+	applyMIGConfiguration(mainContainer, config.MIG.Strategy)
+
+	// update MPS volumes if a custom MPS root is configured
+	if config.DevicePlugin.MPS != nil && config.DevicePlugin.MPS.Root != "" &&
+		config.DevicePlugin.MPS.Root != DefaultMPSRoot {
+		for i, volume := range obj.Spec.Template.Spec.Volumes {
+			if volume.Name == "mps-root" {
+				obj.Spec.Template.Spec.Volumes[i].HostPath.Path = config.DevicePlugin.MPS.Root
+			} else if volume.Name == "mps-shm" {
+				obj.Spec.Template.Spec.Volumes[i].HostPath.Path = filepath.Join(config.DevicePlugin.MPS.Root, "shm")
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -1273,9 +1396,7 @@ func TransformSandboxDevicePlugin(obj *appsv1.DaemonSet, config *gpuv1.ClusterPo
 	obj.Spec.Template.Spec.Containers[0].ImagePullPolicy = gpuv1.ImagePullPolicy(config.SandboxDevicePlugin.ImagePullPolicy)
 	// set image pull secrets
 	if len(config.SandboxDevicePlugin.ImagePullSecrets) > 0 {
-		for _, secret := range config.SandboxDevicePlugin.ImagePullSecrets {
-			obj.Spec.Template.Spec.ImagePullSecrets = append(obj.Spec.Template.Spec.ImagePullSecrets, v1.LocalObjectReference{Name: secret})
-		}
+		addPullSecrets(&obj.Spec.Template.Spec, config.SandboxDevicePlugin.ImagePullSecrets)
 	}
 	// set resource limits
 	if config.SandboxDevicePlugin.Resources != nil {
@@ -1317,9 +1438,7 @@ func TransformDCGMExporter(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpe
 	obj.Spec.Template.Spec.Containers[0].ImagePullPolicy = gpuv1.ImagePullPolicy(config.DCGMExporter.ImagePullPolicy)
 	// set image pull secrets
 	if len(config.DCGMExporter.ImagePullSecrets) > 0 {
-		for _, secret := range config.DCGMExporter.ImagePullSecrets {
-			obj.Spec.Template.Spec.ImagePullSecrets = append(obj.Spec.Template.Spec.ImagePullSecrets, v1.LocalObjectReference{Name: secret})
-		}
+		addPullSecrets(&obj.Spec.Template.Spec, config.DCGMExporter.ImagePullSecrets)
 	}
 	// set resource limits
 	if config.DCGMExporter.Resources != nil {
@@ -1342,14 +1461,7 @@ func TransformDCGMExporter(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpe
 
 	// check if DCGM hostengine is enabled as a separate Pod and setup env accordingly
 	if config.DCGM.IsEnabled() {
-		// enable hostNetwork for communication with external DCGM using NODE_IP(localhost)
-		obj.Spec.Template.Spec.HostNetwork = true
-		// set DCGM host engine env. localhost will be substituted during pod runtime
-		dcgmHostPort := int32(DCGMDefaultHostPort)
-		if config.DCGM.HostPort != 0 {
-			dcgmHostPort = config.DCGM.HostPort
-		}
-		setContainerEnv(&(obj.Spec.Template.Spec.Containers[0]), DCGMRemoteEngineEnvName, fmt.Sprintf("localhost:%d", dcgmHostPort))
+		setContainerEnv(&(obj.Spec.Template.Spec.Containers[0]), DCGMRemoteEngineEnvName, fmt.Sprintf("nvidia-dcgm:%d", DCGMDefaultPort))
 	} else {
 		// case for DCGM running on the host itself(DGX BaseOS)
 		remoteEngine := getContainerEnv(&(obj.Spec.Template.Spec.Containers[0]), DCGMRemoteEngineEnvName)
@@ -1358,6 +1470,7 @@ func TransformDCGMExporter(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpe
 			obj.Spec.Template.Spec.HostNetwork = true
 		}
 	}
+
 	// set RuntimeClass for supported runtimes
 	setRuntimeClass(&obj.Spec.Template.Spec, n.runtime, config.Operator.RuntimeClass)
 
@@ -1401,7 +1514,7 @@ func TransformDCGMExporter(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpe
 		return err
 	}
 
-	initContainer := v1.Container{}
+	initContainer := corev1.Container{}
 	if initImage != "" {
 		initContainer.Image = initImage
 	}
@@ -1454,9 +1567,7 @@ func TransformDCGM(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec, n Clu
 	obj.Spec.Template.Spec.Containers[0].ImagePullPolicy = gpuv1.ImagePullPolicy(config.DCGM.ImagePullPolicy)
 	// set image pull secrets
 	if len(config.DCGM.ImagePullSecrets) > 0 {
-		for _, secret := range config.DCGM.ImagePullSecrets {
-			obj.Spec.Template.Spec.ImagePullSecrets = append(obj.Spec.Template.Spec.ImagePullSecrets, v1.LocalObjectReference{Name: secret})
-		}
+		addPullSecrets(&obj.Spec.Template.Spec, config.DCGM.ImagePullSecrets)
 	}
 	// set resource limits
 	if config.DCGM.Resources != nil {
@@ -1474,16 +1585,6 @@ func TransformDCGM(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec, n Clu
 	if len(config.DCGM.Env) > 0 {
 		for _, env := range config.DCGM.Env {
 			setContainerEnv(&(obj.Spec.Template.Spec.Containers[0]), env.Name, env.Value)
-		}
-	}
-
-	// set host port to bind for DCGM engine
-	for i, port := range obj.Spec.Template.Spec.Containers[0].Ports {
-		if port.Name == "dcgm" {
-			obj.Spec.Template.Spec.Containers[0].Ports[i].HostPort = DCGMDefaultHostPort
-			if config.DCGM.HostPort != 0 {
-				obj.Spec.Template.Spec.Containers[0].Ports[i].HostPort = config.DCGM.HostPort
-			}
 		}
 	}
 
@@ -1513,9 +1614,7 @@ func TransformMIGManager(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec,
 
 	// set image pull secrets
 	if len(config.MIGManager.ImagePullSecrets) > 0 {
-		for _, secret := range config.MIGManager.ImagePullSecrets {
-			obj.Spec.Template.Spec.ImagePullSecrets = append(obj.Spec.Template.Spec.ImagePullSecrets, v1.LocalObjectReference{Name: secret})
-		}
+		addPullSecrets(&obj.Spec.Template.Spec, config.MIGManager.ImagePullSecrets)
 	}
 
 	// set resource limits
@@ -1592,9 +1691,7 @@ func TransformKataManager(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec
 
 	// set image pull secrets
 	if len(config.KataManager.ImagePullSecrets) > 0 {
-		for _, secret := range config.KataManager.ImagePullSecrets {
-			obj.Spec.Template.Spec.ImagePullSecrets = append(obj.Spec.Template.Spec.ImagePullSecrets, v1.LocalObjectReference{Name: secret})
-		}
+		addPullSecrets(&obj.Spec.Template.Spec, config.KataManager.ImagePullSecrets)
 	}
 
 	// set resource limits
@@ -1623,6 +1720,9 @@ func TransformKataManager(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec
 	if config.KataManager.Config.ArtifactsDir != "" {
 		artifactsDir = config.KataManager.Config.ArtifactsDir
 	}
+
+	// set env used by readinessProbe to determine path to kata-manager pid file.
+	setContainerEnv(&(obj.Spec.Template.Spec.Containers[0]), "KATA_ARTIFACTS_DIR", artifactsDir)
 
 	artifactsVolMount := corev1.VolumeMount{Name: "kata-artifacts", MountPath: artifactsDir}
 	obj.Spec.Template.Spec.Containers[0].VolumeMounts = append(obj.Spec.Template.Spec.Containers[0].VolumeMounts, artifactsVolMount)
@@ -1682,7 +1782,7 @@ func TransformKataManager(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec
 // TransformVFIOManager transforms VFIO-PCI Manager daemonset with required config as per ClusterPolicy
 func TransformVFIOManager(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec, n ClusterPolicyController) error {
 	// update k8s-driver-manager initContainer
-	err := transformDriverManagerInitContainer(obj, &config.VFIOManager.DriverManager)
+	err := transformDriverManagerInitContainer(obj, &config.VFIOManager.DriverManager, nil)
 	if err != nil {
 		return fmt.Errorf("failed to transform k8s-driver-manager initContainer for VFIO Manager: %v", err)
 	}
@@ -1699,9 +1799,7 @@ func TransformVFIOManager(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec
 
 	// set image pull secrets
 	if len(config.VFIOManager.ImagePullSecrets) > 0 {
-		for _, secret := range config.VFIOManager.ImagePullSecrets {
-			obj.Spec.Template.Spec.ImagePullSecrets = append(obj.Spec.Template.Spec.ImagePullSecrets, v1.LocalObjectReference{Name: secret})
-		}
+		addPullSecrets(&obj.Spec.Template.Spec, config.VFIOManager.ImagePullSecrets)
 	}
 
 	// set resource limits
@@ -1728,6 +1826,51 @@ func TransformVFIOManager(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec
 	return nil
 }
 
+// TransformCCManager transforms CC Manager daemonset with required config as per ClusterPolicy
+func TransformCCManager(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec, n ClusterPolicyController) error {
+	// update image
+	image, err := gpuv1.ImagePath(&config.CCManager)
+	if err != nil {
+		return err
+	}
+	obj.Spec.Template.Spec.Containers[0].Image = image
+
+	// update image pull policy
+	obj.Spec.Template.Spec.Containers[0].ImagePullPolicy = gpuv1.ImagePullPolicy(config.CCManager.ImagePullPolicy)
+
+	// set image pull secrets
+	if len(config.CCManager.ImagePullSecrets) > 0 {
+		addPullSecrets(&obj.Spec.Template.Spec, config.CCManager.ImagePullSecrets)
+	}
+
+	// set resource limits
+	if config.CCManager.Resources != nil {
+		// apply resource limits to all containers
+		for i := range obj.Spec.Template.Spec.Containers {
+			obj.Spec.Template.Spec.Containers[i].Resources.Requests = config.CCManager.Resources.Requests
+			obj.Spec.Template.Spec.Containers[i].Resources.Limits = config.CCManager.Resources.Limits
+		}
+	}
+
+	// set arguments if specified for cc-manager container
+	if len(config.CCManager.Args) > 0 {
+		obj.Spec.Template.Spec.Containers[0].Args = config.CCManager.Args
+	}
+
+	// set/append environment variables for cc-manager container
+	if len(config.CCManager.Env) > 0 {
+		for _, env := range config.CCManager.Env {
+			setContainerEnv(&(obj.Spec.Template.Spec.Containers[0]), env.Name, env.Value)
+		}
+	}
+	// set default cc mode env
+	if config.CCManager.DefaultMode != "" {
+		setContainerEnv(&(obj.Spec.Template.Spec.Containers[0]), DefaultCCModeEnvName, config.CCManager.DefaultMode)
+	}
+
+	return nil
+}
+
 // TransformVGPUDeviceManager transforms VGPU Device Manager daemonset with required config as per ClusterPolicy
 func TransformVGPUDeviceManager(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec, n ClusterPolicyController) error {
 	// update validation container
@@ -1748,9 +1891,7 @@ func TransformVGPUDeviceManager(obj *appsv1.DaemonSet, config *gpuv1.ClusterPoli
 
 	// set image pull secrets
 	if len(config.VGPUDeviceManager.ImagePullSecrets) > 0 {
-		for _, secret := range config.VGPUDeviceManager.ImagePullSecrets {
-			obj.Spec.Template.Spec.ImagePullSecrets = append(obj.Spec.Template.Spec.ImagePullSecrets, v1.LocalObjectReference{Name: secret})
-		}
+		addPullSecrets(&obj.Spec.Template.Spec, config.VGPUDeviceManager.ImagePullSecrets)
 	}
 
 	// set resource limits
@@ -1809,12 +1950,25 @@ func TransformValidator(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec, 
 	// set RuntimeClass for supported runtimes
 	setRuntimeClass(&obj.Spec.Template.Spec, n.runtime, config.Operator.RuntimeClass)
 
+	var validatorErr error
 	// apply changes for individual component validators(initContainers)
-	TransformValidatorComponent(config, &obj.Spec.Template.Spec, "driver")
-	TransformValidatorComponent(config, &obj.Spec.Template.Spec, "nvidia-fs")
-	TransformValidatorComponent(config, &obj.Spec.Template.Spec, "toolkit")
-	TransformValidatorComponent(config, &obj.Spec.Template.Spec, "cuda")
-	TransformValidatorComponent(config, &obj.Spec.Template.Spec, "plugin")
+	components := []string{
+		"driver",
+		"nvidia-fs",
+		"toolkit",
+		"cuda",
+		"plugin",
+	}
+
+	for _, component := range components {
+		if err := TransformValidatorComponent(config, &obj.Spec.Template.Spec, component); err != nil {
+			validatorErr = errors.Join(validatorErr, err)
+		}
+	}
+
+	if validatorErr != nil {
+		n.logger.Info("WARN: errors transforming the validator containers: %v", validatorErr)
+	}
 
 	return nil
 }
@@ -1826,10 +1980,24 @@ func TransformSandboxValidator(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolic
 		return fmt.Errorf("%v", err)
 	}
 
+	var validatorErr error
 	// apply changes for individual component validators(initContainers)
-	TransformValidatorComponent(config, &obj.Spec.Template.Spec, "vfio-pci")
-	TransformValidatorComponent(config, &obj.Spec.Template.Spec, "vgpu-manager")
-	TransformValidatorComponent(config, &obj.Spec.Template.Spec, "vgpu-devices")
+	components := []string{
+		"cc-manager",
+		"vfio-pci",
+		"vgpu-manager",
+		"vgpu-devices",
+	}
+
+	for _, component := range components {
+		if err := TransformValidatorComponent(config, &obj.Spec.Template.Spec, component); err != nil {
+			validatorErr = errors.Join(validatorErr, err)
+		}
+	}
+
+	if validatorErr != nil {
+		n.logger.Info("WARN: errors transforming the validator containers: %v", validatorErr)
+	}
 
 	return nil
 }
@@ -1846,9 +2014,7 @@ func TransformValidatorShared(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicy
 	obj.Spec.Template.Spec.Containers[0].ImagePullPolicy = gpuv1.ImagePullPolicy(config.Validator.ImagePullPolicy)
 	// set image pull secrets
 	if len(config.Validator.ImagePullSecrets) > 0 {
-		for _, secret := range config.Validator.ImagePullSecrets {
-			obj.Spec.Template.Spec.ImagePullSecrets = append(obj.Spec.Template.Spec.ImagePullSecrets, v1.LocalObjectReference{Name: secret})
-		}
+		addPullSecrets(&obj.Spec.Template.Spec, config.Validator.ImagePullSecrets)
 	}
 	// set resource limits
 	if config.Validator.Resources != nil {
@@ -1878,11 +2044,6 @@ func TransformValidatorComponent(config *gpuv1.ClusterPolicySpec, podSpec *corev
 		// skip if not component validation initContainer
 		if !strings.Contains(initContainer.Name, fmt.Sprintf("%s-validation", component)) {
 			continue
-		}
-		if component == "nvidia-fs" && (config.GPUDirectStorage == nil || !config.GPUDirectStorage.IsEnabled()) {
-			// remove  nvidia-fs init container from validator Daemonset if GDS is not enabled
-			podSpec.InitContainers = append(podSpec.InitContainers[:i], podSpec.InitContainers[i+1:]...)
-			return nil
 		}
 		// update validation image
 		image, err := gpuv1.ImagePath(&config.Validator)
@@ -1914,6 +2075,11 @@ func TransformValidatorComponent(config *gpuv1.ClusterPolicySpec, podSpec *corev
 				setContainerEnv(&(podSpec.InitContainers[i]), ValidatorRuntimeClassEnvName, *podSpec.RuntimeClassName)
 			}
 		case "plugin":
+			// remove plugin init container from validator Daemonset if it is not enabled
+			if !config.DevicePlugin.IsEnabled() {
+				podSpec.InitContainers = append(podSpec.InitContainers[:i], podSpec.InitContainers[i+1:]...)
+				return nil
+			}
 			// set/append environment variables for plugin-validation container
 			if len(config.Validator.Plugin.Env) > 0 {
 				for _, env := range config.Validator.Plugin.Env {
@@ -1941,7 +2107,17 @@ func TransformValidatorComponent(config *gpuv1.ClusterPolicySpec, podSpec *corev
 				}
 			}
 		case "nvidia-fs":
-			// no additional config required for nvidia-fs validation
+			if config.GPUDirectStorage == nil || !config.GPUDirectStorage.IsEnabled() {
+				// remove  nvidia-fs init container from validator Daemonset if GDS is not enabled
+				podSpec.InitContainers = append(podSpec.InitContainers[:i], podSpec.InitContainers[i+1:]...)
+				return nil
+			}
+		case "cc-manager":
+			if !config.CCManager.IsEnabled() {
+				// remove  cc-manager init container from validator Daemonset if it is not enabled
+				podSpec.InitContainers = append(podSpec.InitContainers[:i], podSpec.InitContainers[i+1:]...)
+				return nil
+			}
 		case "toolkit":
 			// set/append environment variables for toolkit-validation container
 			if len(config.Validator.Toolkit.Env) > 0 {
@@ -2000,9 +2176,7 @@ func TransformNodeStatusExporter(obj *appsv1.DaemonSet, config *gpuv1.ClusterPol
 
 	// set image pull secrets
 	if len(config.NodeStatusExporter.ImagePullSecrets) > 0 {
-		for _, secret := range config.NodeStatusExporter.ImagePullSecrets {
-			obj.Spec.Template.Spec.ImagePullSecrets = append(obj.Spec.Template.Spec.ImagePullSecrets, v1.LocalObjectReference{Name: secret})
-		}
+		addPullSecrets(&obj.Spec.Template.Spec, config.NodeStatusExporter.ImagePullSecrets)
 	}
 
 	// set resource limits
@@ -2115,7 +2289,7 @@ func setRuntimeClass(podSpec *corev1.PodSpec, runtime gpuv1.Runtime, runtimeClas
 	}
 }
 
-func setContainerProbe(container *corev1.Container, probe *gpuv1.ContainerProbeSpec, probeType ContainerProbe) error {
+func setContainerProbe(container *corev1.Container, probe *gpuv1.ContainerProbeSpec, probeType ContainerProbe) {
 	var containerProbe *corev1.Probe
 
 	// determine probe type to update
@@ -2126,8 +2300,6 @@ func setContainerProbe(container *corev1.Container, probe *gpuv1.ContainerProbeS
 		containerProbe = container.LivenessProbe
 	case Readiness:
 		containerProbe = container.ReadinessProbe
-	default:
-		return fmt.Errorf("invalid container probe type %s specified", probeType)
 	}
 
 	// set probe parameters if specified
@@ -2146,7 +2318,6 @@ func setContainerProbe(container *corev1.Container, probe *gpuv1.ContainerProbeS
 	if probe.PeriodSeconds != 0 {
 		containerProbe.PeriodSeconds = probe.PeriodSeconds
 	}
-	return nil
 }
 
 // applies MIG related configuration env to container spec
@@ -2203,7 +2374,12 @@ func handleDevicePluginConfig(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicy
 	// Apply custom configuration provided through ConfigMap
 	// setup env for main container
 	for i, container := range obj.Spec.Template.Spec.Containers {
-		if container.Name != "nvidia-device-plugin" && container.Name != "gpu-feature-discovery" {
+		switch container.Name {
+		case "nvidia-device-plugin":
+		case "gpu-feature-discovery":
+		case "mps-control-daemon-ctr":
+		default:
+			// skip if not the main container
 			continue
 		}
 		setContainerEnv(&obj.Spec.Template.Spec.Containers[i], "CONFIG_FILE", "/config/config.yaml")
@@ -2288,7 +2464,7 @@ func transformConfigManagerSidecarContainer(obj *appsv1.DaemonSet, config *gpuv1
 	return nil
 }
 
-func transformDriverManagerInitContainer(obj *appsv1.DaemonSet, driverManagerSpec *gpuv1.DriverManagerSpec) error {
+func transformDriverManagerInitContainer(obj *appsv1.DaemonSet, driverManagerSpec *gpuv1.DriverManagerSpec, rdmaSpec *gpuv1.GPUDirectRDMASpec) error {
 	var container *corev1.Container
 	for i, initCtr := range obj.Spec.Template.Spec.InitContainers {
 		if initCtr.Name == "k8s-driver-manager" {
@@ -2311,6 +2487,13 @@ func transformDriverManagerInitContainer(obj *appsv1.DaemonSet, driverManagerSpe
 		container.ImagePullPolicy = gpuv1.ImagePullPolicy(driverManagerSpec.ImagePullPolicy)
 	}
 
+	if rdmaSpec != nil && rdmaSpec.IsEnabled() {
+		setContainerEnv(container, GPUDirectRDMAEnabledEnvName, "true")
+		if rdmaSpec.IsHostMOFED() {
+			setContainerEnv(container, UseHostMOFEDEnvName, "true")
+		}
+	}
+
 	// set/append environment variables for driver-manager initContainer
 	if len(driverManagerSpec.Env) > 0 {
 		for _, env := range driverManagerSpec.Env {
@@ -2320,9 +2503,7 @@ func transformDriverManagerInitContainer(obj *appsv1.DaemonSet, driverManagerSpe
 
 	// add any pull secrets needed for driver-manager image
 	if len(driverManagerSpec.ImagePullSecrets) > 0 {
-		for _, secret := range driverManagerSpec.ImagePullSecrets {
-			obj.Spec.Template.Spec.ImagePullSecrets = append(obj.Spec.Template.Spec.ImagePullSecrets, v1.LocalObjectReference{Name: secret})
-		}
+		addPullSecrets(&obj.Spec.Template.Spec, driverManagerSpec.ImagePullSecrets)
 	}
 
 	return nil
@@ -2378,7 +2559,7 @@ func transformGDSContainer(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpe
 			continue
 		}
 		if config.GPUDirectStorage == nil || !config.GPUDirectStorage.IsEnabled() {
-			n.rec.Log.Info("GPUDirect Storage is disabled")
+			n.logger.Info("GPUDirect Storage is disabled")
 			// remove nvidia-fs sidecar container from driver Daemonset if GDS is not enabled
 			obj.Spec.Template.Spec.Containers = append(obj.Spec.Template.Spec.Containers[:i], obj.Spec.Template.Spec.Containers[i+1:]...)
 			return nil
@@ -2386,6 +2567,11 @@ func transformGDSContainer(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpe
 		if config.Driver.UsePrecompiledDrivers() {
 			return fmt.Errorf("GPUDirect Storage driver (nvidia-fs) is not supported along with pre-compiled NVIDIA drivers")
 		}
+		if config.GPUDirectStorage.IsOpenKernelModulesRequired() && !config.Driver.OpenKernelModulesEnabled() {
+			return fmt.Errorf("GPUDirect Storage driver '%s' is only supported with NVIDIA OpenRM drivers. Please set 'driver.useOpenKernelModules=true' in ClusterPolicy to enable OpenRM mode", config.GPUDirectStorage.Version)
+		}
+
+		gdsContainer := &obj.Spec.Template.Spec.Containers[i]
 
 		// update nvidia-fs(sidecar) image and pull policy
 		gdsImage, err := resolveDriverTag(n, config.GPUDirectStorage)
@@ -2393,17 +2579,49 @@ func transformGDSContainer(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpe
 			return err
 		}
 		if gdsImage != "" {
-			obj.Spec.Template.Spec.Containers[i].Image = gdsImage
+			gdsContainer.Image = gdsImage
 		}
 		if config.GPUDirectStorage.ImagePullPolicy != "" {
-			obj.Spec.Template.Spec.Containers[i].ImagePullPolicy = gpuv1.ImagePullPolicy(config.GPUDirectStorage.ImagePullPolicy)
+			gdsContainer.ImagePullPolicy = gpuv1.ImagePullPolicy(config.GPUDirectStorage.ImagePullPolicy)
 		}
 
 		// set image pull secrets
 		if len(config.GPUDirectStorage.ImagePullSecrets) > 0 {
-			for _, secret := range config.GPUDirectStorage.ImagePullSecrets {
-				obj.Spec.Template.Spec.ImagePullSecrets = append(obj.Spec.Template.Spec.ImagePullSecrets, v1.LocalObjectReference{Name: secret})
+			addPullSecrets(&obj.Spec.Template.Spec, config.GPUDirectStorage.ImagePullSecrets)
+		}
+
+		// set/append environment variables for GDS container
+		if len(config.GPUDirectStorage.Env) > 0 {
+			for _, env := range config.GPUDirectStorage.Env {
+				setContainerEnv(gdsContainer, env.Name, env.Value)
 			}
+		}
+
+		if config.Driver.RepoConfig != nil && config.Driver.RepoConfig.ConfigMapName != "" {
+			// note: transformDriverContainer() will have already created a Volume backed by the ConfigMap.
+			// Only add a VolumeMount for nvidia-fs-ctr.
+			destinationDir, err := getRepoConfigPath()
+			if err != nil {
+				return fmt.Errorf("ERROR: failed to get destination directory for custom repo config: %w", err)
+			}
+			volumeMounts, _, err := createConfigMapVolumeMounts(n, config.Driver.RepoConfig.ConfigMapName, destinationDir)
+			if err != nil {
+				return fmt.Errorf("ERROR: failed to create ConfigMap VolumeMounts for custom package repo config: %w", err)
+			}
+			gdsContainer.VolumeMounts = append(gdsContainer.VolumeMounts, volumeMounts...)
+		}
+
+		// set any custom ssl key/certificate configuration provided
+		if config.Driver.CertConfig != nil && config.Driver.CertConfig.Name != "" {
+			destinationDir, err := getCertConfigPath()
+			if err != nil {
+				return fmt.Errorf("ERROR: failed to get destination directory for ssl key/cert config: %w", err)
+			}
+			volumeMounts, _, err := createConfigMapVolumeMounts(n, config.Driver.CertConfig.Name, destinationDir)
+			if err != nil {
+				return fmt.Errorf("ERROR: failed to create ConfigMap VolumeMounts for custom certs: %w", err)
+			}
+			gdsContainer.VolumeMounts = append(gdsContainer.VolumeMounts, volumeMounts...)
 		}
 
 		// transform the nvidia-fs-ctr to use the openshift driver toolkit
@@ -2411,6 +2629,85 @@ func transformGDSContainer(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpe
 		err = transformOpenShiftDriverToolkitContainer(obj, config, n, "nvidia-fs-ctr")
 		if err != nil {
 			return fmt.Errorf("ERROR: failed to transform the Driver Toolkit Container: %s", err)
+		}
+	}
+	return nil
+}
+
+func transformGDRCopyContainer(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec, n ClusterPolicyController) error {
+	for i, container := range obj.Spec.Template.Spec.Containers {
+		// skip if not nvidia-gdrcopy
+		if !strings.HasPrefix(container.Name, "nvidia-gdrcopy") {
+			continue
+		}
+		if config.GDRCopy == nil || !config.GDRCopy.IsEnabled() {
+			n.logger.Info("GDRCopy is disabled")
+			// remove nvidia-gdrcopy sidecar container from driver Daemonset if gdrcopy is not enabled
+			obj.Spec.Template.Spec.Containers = append(obj.Spec.Template.Spec.Containers[:i], obj.Spec.Template.Spec.Containers[i+1:]...)
+			return nil
+		}
+		if config.Driver.UsePrecompiledDrivers() {
+			return fmt.Errorf("GDRCopy is not supported along with pre-compiled NVIDIA drivers")
+		}
+
+		gdrcopyContainer := &obj.Spec.Template.Spec.Containers[i]
+
+		// update nvidia-gdrcopy image and pull policy
+		gdrcopyImage, err := resolveDriverTag(n, config.GDRCopy)
+		if err != nil {
+			return err
+		}
+		if gdrcopyImage != "" {
+			gdrcopyContainer.Image = gdrcopyImage
+		}
+		if config.GDRCopy.ImagePullPolicy != "" {
+			gdrcopyContainer.ImagePullPolicy = gpuv1.ImagePullPolicy(config.GDRCopy.ImagePullPolicy)
+		}
+
+		// set image pull secrets
+		if len(config.GDRCopy.ImagePullSecrets) > 0 {
+			addPullSecrets(&obj.Spec.Template.Spec, config.GDRCopy.ImagePullSecrets)
+		}
+
+		// set/append environment variables for gdrcopy container
+		if len(config.GDRCopy.Env) > 0 {
+			for _, env := range config.GDRCopy.Env {
+				setContainerEnv(gdrcopyContainer, env.Name, env.Value)
+			}
+		}
+
+		if config.Driver.RepoConfig != nil && config.Driver.RepoConfig.ConfigMapName != "" {
+			// note: transformDriverContainer() will have already created a Volume backed by the ConfigMap.
+			// Only add a VolumeMount for nvidia-gdrcopy-ctr.
+			destinationDir, err := getRepoConfigPath()
+			if err != nil {
+				return fmt.Errorf("ERROR: failed to get destination directory for custom repo config: %w", err)
+			}
+			volumeMounts, _, err := createConfigMapVolumeMounts(n, config.Driver.RepoConfig.ConfigMapName, destinationDir)
+			if err != nil {
+				return fmt.Errorf("ERROR: failed to create ConfigMap VolumeMounts for custom package repo config: %w", err)
+			}
+			gdrcopyContainer.VolumeMounts = append(gdrcopyContainer.VolumeMounts, volumeMounts...)
+		}
+
+		// set any custom ssl key/certificate configuration provided
+		if config.Driver.CertConfig != nil && config.Driver.CertConfig.Name != "" {
+			destinationDir, err := getCertConfigPath()
+			if err != nil {
+				return fmt.Errorf("ERROR: failed to get destination directory for ssl key/cert config: %w", err)
+			}
+			volumeMounts, _, err := createConfigMapVolumeMounts(n, config.Driver.CertConfig.Name, destinationDir)
+			if err != nil {
+				return fmt.Errorf("ERROR: failed to create ConfigMap VolumeMounts for custom certs: %w", err)
+			}
+			gdrcopyContainer.VolumeMounts = append(gdrcopyContainer.VolumeMounts, volumeMounts...)
+		}
+
+		// transform the nvidia-gdrcopy-ctr to use the openshift driver toolkit
+		// notify openshift driver toolkit container that gdrcopy is enabled
+		err = transformOpenShiftDriverToolkitContainer(obj, config, n, "nvidia-gdrcopy-ctr")
+		if err != nil {
+			return fmt.Errorf("ERROR: failed to transform the Driver Toolkit Container: %w", err)
 		}
 	}
 	return nil
@@ -2444,7 +2741,7 @@ func transformPrecompiledDriverDaemonset(obj *appsv1.DaemonSet, config *gpuv1.Cl
 func transformOpenShiftDriverToolkitContainer(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec, n ClusterPolicyController, mainContainerName string) error {
 	var err error
 
-	getContainer := func(name string, remove bool) (*v1.Container, error) {
+	getContainer := func(name string, remove bool) (*corev1.Container, error) {
 		for i, container := range obj.Spec.Template.Spec.Containers {
 			if container.Name != name {
 				continue
@@ -2468,7 +2765,7 @@ func transformOpenShiftDriverToolkitContainer(obj *appsv1.DaemonSet, config *gpu
 
 	if !n.ocpDriverToolkit.enabled {
 		if n.ocpDriverToolkit.requested {
-			n.rec.Log.Info("OpenShift DriverToolkit was requested but could not be enabled (dependencies missing)")
+			n.logger.Info("OpenShift DriverToolkit was requested but could not be enabled (dependencies missing)")
 		}
 
 		/* remove OpenShift Driver Toolkit side-car container from the Driver DaemonSet */
@@ -2477,7 +2774,7 @@ func transformOpenShiftDriverToolkitContainer(obj *appsv1.DaemonSet, config *gpu
 	}
 
 	/* find the main container and driver-toolkit sidecar container */
-	var mainContainer, driverToolkitContainer *v1.Container
+	var mainContainer, driverToolkitContainer *corev1.Container
 	if mainContainer, err = getContainer(mainContainerName, false); err != nil {
 		return err
 	}
@@ -2508,13 +2805,18 @@ func transformOpenShiftDriverToolkitContainer(obj *appsv1.DaemonSet, config *gpu
 
 	if config.GPUDirectStorage != nil && config.GPUDirectStorage.IsEnabled() {
 		setContainerEnv(driverToolkitContainer, "GDS_ENABLED", "true")
-		n.rec.Log.V(2).Info("transformOpenShiftDriverToolkitContainer", "GDS_ENABLED", config.GPUDirectStorage.IsEnabled())
+		n.logger.V(2).Info("transformOpenShiftDriverToolkitContainer", "GDS_ENABLED", config.GPUDirectStorage.IsEnabled())
+	}
+
+	if config.GDRCopy != nil && config.GDRCopy.IsEnabled() {
+		setContainerEnv(driverToolkitContainer, "GDRCOPY_ENABLED", "true")
+		n.logger.V(2).Info("transformOpenShiftDriverToolkitContainer", "GDRCOPY_ENABLED", "true")
 	}
 
 	image := n.ocpDriverToolkit.rhcosDriverToolkitImages[n.ocpDriverToolkit.currentRhcosVersion]
 	if image != "" {
 		driverToolkitContainer.Image = image
-		n.rec.Log.Info("DriverToolkit", "image", driverToolkitContainer.Image)
+		n.logger.Info("DriverToolkit", "image", driverToolkitContainer.Image)
 	} else {
 		/* RHCOS tag missing in the Driver-Toolkit imagestream, setup fallback */
 		obj.ObjectMeta.Labels["openshift.driver-toolkit.rhcos-image-missing"] = "true"
@@ -2525,17 +2827,22 @@ func transformOpenShiftDriverToolkitContainer(obj *appsv1.DaemonSet, config *gpu
 		setContainerEnv(mainContainer, "RHCOS_VERSION", rhcosVersion)
 		setContainerEnv(driverToolkitContainer, "RHCOS_IMAGE_MISSING", "true")
 
-		n.rec.Log.Info("WARNING: DriverToolkit image tag missing. Version-specific fallback mode enabled.", "rhcosVersion", rhcosVersion)
+		n.logger.Info("WARNING: DriverToolkit image tag missing. Version-specific fallback mode enabled.", "rhcosVersion", rhcosVersion)
 	}
 
 	/* prepare the main container to start from the DriverToolkit entrypoint */
-	if strings.Contains(mainContainerName, "nvidia-fs") {
+	switch mainContainerName {
+	case "nvidia-fs-ctr":
 		mainContainer.Command = []string{"ocp_dtk_entrypoint"}
 		mainContainer.Args = []string{"nv-fs-ctr-run-with-dtk"}
-	} else {
+	case "nvidia-gdrcopy-ctr":
+		mainContainer.Command = []string{"ocp_dtk_entrypoint"}
+		mainContainer.Args = []string{"gdrcopy-ctr-run-with-dtk"}
+	default:
 		mainContainer.Command = []string{"ocp_dtk_entrypoint"}
 		mainContainer.Args = []string{"nv-ctr-run-with-dtk"}
 	}
+
 	/* prepare the shared volumes */
 	// shared directory
 	volSharedDirName, volSharedDirPath := "shared-nvidia-driver-toolkit", "/mnt/shared-nvidia-driver-toolkit"
@@ -2606,6 +2913,12 @@ func resolveDriverTag(n ClusterPolicyController, driverSpec interface{}) (string
 		if err != nil {
 			return "", err
 		}
+	case *gpuv1.GDRCopySpec:
+		spec := driverSpec.(*gpuv1.GDRCopySpec)
+		image, err = gpuv1.ImagePath(spec)
+		if err != nil {
+			return "", err
+		}
 	default:
 		return "", fmt.Errorf("Invalid type to construct image path: %v", v)
 	}
@@ -2669,7 +2982,7 @@ func createConfigMapVolumeMounts(n ClusterPolicyController, configMapName string
 	// get the ConfigMap
 	cm := &corev1.ConfigMap{}
 	opts := client.ObjectKey{Namespace: n.operatorNamespace, Name: configMapName}
-	err := n.rec.Client.Get(ctx, opts, cm)
+	err := n.client.Get(ctx, opts, cm)
 	if err != nil {
 		return nil, nil, fmt.Errorf("ERROR: could not get ConfigMap %s from client: %v", configMapName, err)
 	}
@@ -2718,7 +3031,9 @@ func createEmptyDirVolume(volumeName string) corev1.Volume {
 func transformDriverContainer(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec, n ClusterPolicyController) error {
 	driverIndex := 0
 	driverCtrFound := false
-	for i, container := range obj.Spec.Template.Spec.Containers {
+
+	podSpec := &obj.Spec.Template.Spec
+	for i, container := range podSpec.Containers {
 		// check if this is the main nvidia-driver container
 		if container.Name == "nvidia-driver-ctr" {
 			driverIndex = i
@@ -2731,70 +3046,74 @@ func transformDriverContainer(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicy
 		return fmt.Errorf("driver container (nvidia-driver-ctr) is missing from the driver daemonset manifest")
 	}
 
+	driverContainer := &podSpec.Containers[driverIndex]
+
 	image, err := resolveDriverTag(n, &config.Driver)
 	if err != nil {
 		return err
 	}
 	if image != "" {
-		obj.Spec.Template.Spec.Containers[driverIndex].Image = image
+		driverContainer.Image = image
 	}
 
 	// update image pull policy
-	obj.Spec.Template.Spec.Containers[driverIndex].ImagePullPolicy = gpuv1.ImagePullPolicy(config.Driver.ImagePullPolicy)
+	driverContainer.ImagePullPolicy = gpuv1.ImagePullPolicy(config.Driver.ImagePullPolicy)
 
 	// set image pull secrets
 	if len(config.Driver.ImagePullSecrets) > 0 {
-		for _, secret := range config.Driver.ImagePullSecrets {
-			obj.Spec.Template.Spec.ImagePullSecrets = append(obj.Spec.Template.Spec.ImagePullSecrets, v1.LocalObjectReference{Name: secret})
-		}
+		addPullSecrets(&obj.Spec.Template.Spec, config.Driver.ImagePullSecrets)
 	}
 	// set resource limits
 	if config.Driver.Resources != nil {
-		obj.Spec.Template.Spec.Containers[driverIndex].Resources.Requests = config.Driver.Resources.Requests
-		obj.Spec.Template.Spec.Containers[driverIndex].Resources.Limits = config.Driver.Resources.Limits
+		driverContainer.Resources.Requests = config.Driver.Resources.Requests
+		driverContainer.Resources.Limits = config.Driver.Resources.Limits
 	}
 	// set arguments if specified for driver container
 	if len(config.Driver.Args) > 0 {
-		obj.Spec.Template.Spec.Containers[driverIndex].Args = config.Driver.Args
+		driverContainer.Args = config.Driver.Args
 	}
-	// set/append environment variables for exporter container
+	// set/append environment variables for driver container
 	if len(config.Driver.Env) > 0 {
 		for _, env := range config.Driver.Env {
-			setContainerEnv(&(obj.Spec.Template.Spec.Containers[driverIndex]), env.Name, env.Value)
+			setContainerEnv(driverContainer, env.Name, env.Value)
 		}
 	}
+	if config.Driver.OpenKernelModulesEnabled() {
+		setContainerEnv(driverContainer, OpenKernelModulesEnabledEnvName, "true")
+	}
+
 	// set container probe timeouts
 	if config.Driver.StartupProbe != nil {
-		setContainerProbe(&(obj.Spec.Template.Spec.Containers[driverIndex]), config.Driver.StartupProbe, Startup)
+		setContainerProbe(driverContainer, config.Driver.StartupProbe, Startup)
 	}
 	if config.Driver.LivenessProbe != nil {
-		setContainerProbe(&(obj.Spec.Template.Spec.Containers[driverIndex]), config.Driver.LivenessProbe, Liveness)
+		setContainerProbe(driverContainer, config.Driver.LivenessProbe, Liveness)
 	}
 	if config.Driver.ReadinessProbe != nil {
-		setContainerProbe(&(obj.Spec.Template.Spec.Containers[driverIndex]), config.Driver.ReadinessProbe, Readiness)
+		setContainerProbe(driverContainer, config.Driver.ReadinessProbe, Readiness)
 	}
 
 	if config.Driver.GPUDirectRDMA != nil && config.Driver.GPUDirectRDMA.IsEnabled() {
 		// set env indicating nvidia-peermem is enabled to compile module with required ib_* interfaces
-		setContainerEnv(&(obj.Spec.Template.Spec.Containers[driverIndex]), GPUDirectRDMAEnabledEnvName, "true")
+		setContainerEnv(driverContainer, GPUDirectRDMAEnabledEnvName, "true")
 		// check if MOFED drives are directly installed on host and update source path accordingly
 		// to build nvidia-peermem module
 		if config.Driver.GPUDirectRDMA.UseHostMOFED != nil && *config.Driver.GPUDirectRDMA.UseHostMOFED {
 			// mount /usr/src/ofa_kernel path directly from host to build using MOFED drivers installed on host
-			for index, volume := range obj.Spec.Template.Spec.Volumes {
+			for index, volume := range podSpec.Volumes {
 				if volume.Name == "mlnx-ofed-usr-src" {
-					obj.Spec.Template.Spec.Volumes[index].HostPath.Path = "/usr/src"
+					podSpec.Volumes[index].HostPath.Path = "/usr/src"
 				}
 			}
 			// set env indicating host-mofed is enabled
-			setContainerEnv(&(obj.Spec.Template.Spec.Containers[driverIndex]), UseHostMOFEDEnvName, "true")
+			setContainerEnv(driverContainer, UseHostMOFEDEnvName, "true")
 		}
 	}
 
 	// set any licensing configuration required
 	if config.Driver.LicensingConfig != nil && config.Driver.LicensingConfig.ConfigMapName != "" {
 		licensingConfigVolMount := corev1.VolumeMount{Name: "licensing-config", ReadOnly: true, MountPath: VGPULicensingConfigMountPath, SubPath: VGPULicensingFileName}
-		obj.Spec.Template.Spec.Containers[driverIndex].VolumeMounts = append(obj.Spec.Template.Spec.Containers[driverIndex].VolumeMounts, licensingConfigVolMount)
+		driverContainer.VolumeMounts = append(driverContainer.VolumeMounts, licensingConfigVolMount)
 
 		// gridd.conf always mounted
 		licenseItemsToInclude := []corev1.KeyToPath{
@@ -2810,7 +3129,7 @@ func transformDriverContainer(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicy
 				Path: NLSClientTokenFileName,
 			})
 			nlsTokenVolMount := corev1.VolumeMount{Name: "licensing-config", ReadOnly: true, MountPath: NLSClientTokenMountPath, SubPath: NLSClientTokenFileName}
-			obj.Spec.Template.Spec.Containers[driverIndex].VolumeMounts = append(obj.Spec.Template.Spec.Containers[driverIndex].VolumeMounts, nlsTokenVolMount)
+			driverContainer.VolumeMounts = append(driverContainer.VolumeMounts, nlsTokenVolMount)
 		}
 
 		licensingConfigVolumeSource := corev1.VolumeSource{
@@ -2822,13 +3141,13 @@ func transformDriverContainer(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicy
 			},
 		}
 		licensingConfigVol := corev1.Volume{Name: "licensing-config", VolumeSource: licensingConfigVolumeSource}
-		obj.Spec.Template.Spec.Volumes = append(obj.Spec.Template.Spec.Volumes, licensingConfigVol)
+		podSpec.Volumes = append(podSpec.Volumes, licensingConfigVol)
 	}
 
 	// set virtual topology daemon configuration if specified for vGPU driver
 	if config.Driver.VirtualTopology != nil && config.Driver.VirtualTopology.Config != "" {
 		topologyConfigVolMount := corev1.VolumeMount{Name: "topology-config", ReadOnly: true, MountPath: VGPUTopologyConfigMountPath, SubPath: VGPUTopologyConfigFileName}
-		obj.Spec.Template.Spec.Containers[driverIndex].VolumeMounts = append(obj.Spec.Template.Spec.Containers[driverIndex].VolumeMounts, topologyConfigVolMount)
+		driverContainer.VolumeMounts = append(driverContainer.VolumeMounts, topologyConfigVolMount)
 
 		topologyConfigVolumeSource := corev1.VolumeSource{
 			ConfigMap: &corev1.ConfigMapVolumeSource{
@@ -2844,7 +3163,7 @@ func transformDriverContainer(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicy
 			},
 		}
 		topologyConfigVol := corev1.Volume{Name: "topology-config", VolumeSource: topologyConfigVolumeSource}
-		obj.Spec.Template.Spec.Volumes = append(obj.Spec.Template.Spec.Volumes, topologyConfigVol)
+		podSpec.Volumes = append(podSpec.Volumes, topologyConfigVol)
 	}
 
 	// mount any custom kernel module configuration parameters at /drivers
@@ -2854,8 +3173,8 @@ func transformDriverContainer(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicy
 		if err != nil {
 			return fmt.Errorf("ERROR: failed to create ConfigMap VolumeMounts for kernel module configuration: %v", err)
 		}
-		obj.Spec.Template.Spec.Containers[driverIndex].VolumeMounts = append(obj.Spec.Template.Spec.Containers[driverIndex].VolumeMounts, volumeMounts...)
-		obj.Spec.Template.Spec.Volumes = append(obj.Spec.Template.Spec.Volumes, createConfigMapVolume(config.Driver.KernelModuleConfig.Name, itemsToInclude))
+		driverContainer.VolumeMounts = append(driverContainer.VolumeMounts, volumeMounts...)
+		podSpec.Volumes = append(podSpec.Volumes, createConfigMapVolume(config.Driver.KernelModuleConfig.Name, itemsToInclude))
 	}
 
 	// no further repo configuration required when using pre-compiled drivers, return here.
@@ -2873,8 +3192,8 @@ func transformDriverContainer(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicy
 		if err != nil {
 			return fmt.Errorf("ERROR: failed to create ConfigMap VolumeMounts for custom repo config: %v", err)
 		}
-		obj.Spec.Template.Spec.Containers[driverIndex].VolumeMounts = append(obj.Spec.Template.Spec.Containers[driverIndex].VolumeMounts, volumeMounts...)
-		obj.Spec.Template.Spec.Volumes = append(obj.Spec.Template.Spec.Volumes, createConfigMapVolume(config.Driver.RepoConfig.ConfigMapName, itemsToInclude))
+		driverContainer.VolumeMounts = append(driverContainer.VolumeMounts, volumeMounts...)
+		podSpec.Volumes = append(podSpec.Volumes, createConfigMapVolume(config.Driver.RepoConfig.ConfigMapName, itemsToInclude))
 	}
 
 	// set any custom ssl key/certificate configuration provided
@@ -2887,8 +3206,8 @@ func transformDriverContainer(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicy
 		if err != nil {
 			return fmt.Errorf("ERROR: failed to create ConfigMap VolumeMounts for custom certs: %v", err)
 		}
-		obj.Spec.Template.Spec.Containers[driverIndex].VolumeMounts = append(obj.Spec.Template.Spec.Containers[driverIndex].VolumeMounts, volumeMounts...)
-		obj.Spec.Template.Spec.Volumes = append(obj.Spec.Template.Spec.Volumes, createConfigMapVolume(config.Driver.CertConfig.Name, itemsToInclude))
+		driverContainer.VolumeMounts = append(driverContainer.VolumeMounts, volumeMounts...)
+		podSpec.Volumes = append(podSpec.Volumes, createConfigMapVolume(config.Driver.CertConfig.Name, itemsToInclude))
 	}
 
 	release, err := parseOSRelease()
@@ -2898,7 +3217,7 @@ func transformDriverContainer(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicy
 
 	// set up subscription entitlements for RHEL(using K8s with a non-CRIO runtime) and SLES
 	if (release["ID"] == "rhel" && n.openshift == "" && n.runtime != gpuv1.CRIO) || release["ID"] == "sles" {
-		n.rec.Log.Info("Mounting subscriptions into the driver container", "OS", release["ID"])
+		n.logger.Info("Mounting subscriptions into the driver container", "OS", release["ID"])
 		pathToVolumeSource, err := getSubscriptionPathsToVolumeSources()
 		if err != nil {
 			return fmt.Errorf("ERROR: failed to get path items for subscription entitlements: %v", err)
@@ -2919,10 +3238,10 @@ func transformDriverContainer(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicy
 				MountPath: mountPath,
 				ReadOnly:  true,
 			}
-			obj.Spec.Template.Spec.Containers[driverIndex].VolumeMounts = append(obj.Spec.Template.Spec.Containers[driverIndex].VolumeMounts, volMountSubscription)
+			driverContainer.VolumeMounts = append(driverContainer.VolumeMounts, volMountSubscription)
 
 			subscriptionVol := corev1.Volume{Name: volMountSubscriptionName, VolumeSource: pathToVolumeSource[mountPath]}
-			obj.Spec.Template.Spec.Volumes = append(obj.Spec.Template.Spec.Volumes, subscriptionVol)
+			podSpec.Volumes = append(podSpec.Volumes, subscriptionVol)
 		}
 	}
 
@@ -2931,16 +3250,12 @@ func transformDriverContainer(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicy
 		return nil
 	}
 
-	// Add env vars needed by nvidia-driver to enable the right releasever and EUS rpm repos
-	rhelVersion := corev1.EnvVar{Name: "RHEL_VERSION", Value: release["RHEL_VERSION"]}
 	ocpVersion := corev1.EnvVar{Name: "OPENSHIFT_VERSION", Value: release["OPENSHIFT_VERSION"]}
-
-	obj.Spec.Template.Spec.Containers[driverIndex].Env = append(obj.Spec.Template.Spec.Containers[driverIndex].Env, rhelVersion)
-	obj.Spec.Template.Spec.Containers[driverIndex].Env = append(obj.Spec.Template.Spec.Containers[driverIndex].Env, ocpVersion)
+	driverContainer.Env = append(driverContainer.Env, ocpVersion)
 
 	// Automatically apply proxy settings for OCP and inject custom CA if configured by user
 	// https://docs.openshift.com/container-platform/4.6/networking/configuring-a-custom-pki.html
-	err = applyOCPProxySpec(n, &obj.Spec.Template.Spec)
+	err = applyOCPProxySpec(n, podSpec)
 	if err != nil {
 		return err
 	}
@@ -2973,9 +3288,7 @@ func transformVGPUManagerContainer(obj *appsv1.DaemonSet, config *gpuv1.ClusterP
 
 	// set image pull secrets
 	if len(config.VGPUManager.ImagePullSecrets) > 0 {
-		for _, secret := range config.VGPUManager.ImagePullSecrets {
-			obj.Spec.Template.Spec.ImagePullSecrets = append(obj.Spec.Template.Spec.ImagePullSecrets, v1.LocalObjectReference{Name: secret})
-		}
+		addPullSecrets(&obj.Spec.Template.Spec, config.VGPUManager.ImagePullSecrets)
 	}
 	// set resource limits
 	if config.VGPUManager.Resources != nil {
@@ -3001,7 +3314,6 @@ func transformVGPUManagerContainer(obj *appsv1.DaemonSet, config *gpuv1.ClusterP
 	// add env for OCP
 	if _, ok := release["OPENSHIFT_VERSION"]; ok {
 		setContainerEnv(container, "OPENSHIFT_VERSION", release["OPENSHIFT_VERSION"])
-		setContainerEnv(container, "RHEL_VERSION", release["RHEL_VERSION"])
 	}
 
 	return nil
@@ -3044,17 +3356,22 @@ func transformValidationInitContainer(obj *appsv1.DaemonSet, config *gpuv1.Clust
 		if !strings.Contains(initContainer.Name, "validation") {
 			continue
 		}
-		if strings.Contains(initContainer.Name, "mofed-validation") {
-			if config.Driver.GPUDirectRDMA == nil || !config.Driver.GPUDirectRDMA.IsEnabled() {
-				// remove mofed-validation init container from driver Daemonset if RDMA is not enabled
-				obj.Spec.Template.Spec.InitContainers = append(obj.Spec.Template.Spec.InitContainers[:i], obj.Spec.Template.Spec.InitContainers[i+1:]...)
-				continue
-			} else {
-				// pass env for mofed-validation
-				setContainerEnv(&(obj.Spec.Template.Spec.InitContainers[i]), GPUDirectRDMAEnabledEnvName, "true")
-				if config.Driver.GPUDirectRDMA.UseHostMOFED != nil && *config.Driver.GPUDirectRDMA.UseHostMOFED {
-					// set env indicating host-mofed is enabled
-					setContainerEnv(&(obj.Spec.Template.Spec.InitContainers[i]), UseHostMOFEDEnvName, "true")
+
+		// TODO: refactor the component-specific validation logic so that we are not duplicating TransformValidatorComponent()
+		// Pass env for driver-validation init container
+		if strings.HasPrefix(initContainer.Name, "driver") {
+			if len(config.Validator.Driver.Env) > 0 {
+				for _, env := range config.Validator.Driver.Env {
+					setContainerEnv(&(obj.Spec.Template.Spec.InitContainers[i]), env.Name, env.Value)
+				}
+			}
+		}
+
+		// Pass env for toolkit-validation init container
+		if strings.HasPrefix(initContainer.Name, "toolkit") {
+			if len(config.Validator.Toolkit.Env) > 0 {
+				for _, env := range config.Validator.Toolkit.Env {
+					setContainerEnv(&(obj.Spec.Template.Spec.InitContainers[i]), env.Name, env.Value)
 				}
 			}
 		}
@@ -3072,30 +3389,45 @@ func transformValidationInitContainer(obj *appsv1.DaemonSet, config *gpuv1.Clust
 	}
 	// add any pull secrets needed for validation image
 	if len(config.Validator.ImagePullSecrets) > 0 {
-		for _, secret := range config.Validator.ImagePullSecrets {
-			obj.Spec.Template.Spec.ImagePullSecrets = append(obj.Spec.Template.Spec.ImagePullSecrets, v1.LocalObjectReference{Name: secret})
-		}
+		addPullSecrets(&obj.Spec.Template.Spec, config.Validator.ImagePullSecrets)
 	}
 	return nil
+}
+
+func addPullSecrets(podSpec *corev1.PodSpec, secrets []string) {
+	for _, secret := range secrets {
+		if !containsSecret(podSpec.ImagePullSecrets, secret) {
+			podSpec.ImagePullSecrets = append(podSpec.ImagePullSecrets, corev1.LocalObjectReference{Name: secret})
+		}
+	}
+}
+
+func containsSecret(secrets []corev1.LocalObjectReference, secretName string) bool {
+	for _, s := range secrets {
+		if s.Name == secretName {
+			return true
+		}
+	}
+	return false
 }
 
 func isDeploymentReady(name string, n ClusterPolicyController) gpuv1.State {
 	opts := []client.ListOption{
 		client.MatchingLabels{"app": name},
 	}
-	n.rec.Log.V(1).Info("Deployment", "LabelSelector", fmt.Sprintf("app=%s", name))
+	n.logger.V(1).Info("Deployment", "LabelSelector", fmt.Sprintf("app=%s", name))
 	list := &appsv1.DeploymentList{}
-	err := n.rec.Client.List(n.ctx, list, opts...)
+	err := n.client.List(n.ctx, list, opts...)
 	if err != nil {
-		n.rec.Log.Info("Could not get DeploymentList", err)
+		n.logger.Info("Could not get DeploymentList", err)
 	}
-	n.rec.Log.V(1).Info("Deployment", "NumberOfDeployment", len(list.Items))
+	n.logger.V(1).Info("Deployment", "NumberOfDeployment", len(list.Items))
 	if len(list.Items) == 0 {
 		return gpuv1.NotReady
 	}
 
 	ds := list.Items[0]
-	n.rec.Log.V(1).Info("Deployment", "NumberUnavailable", ds.Status.UnavailableReplicas)
+	n.logger.V(1).Info("Deployment", "NumberUnavailable", ds.Status.UnavailableReplicas)
 
 	if ds.Status.UnavailableReplicas != 0 {
 		return gpuv1.NotReady
@@ -3107,14 +3439,19 @@ func isDeploymentReady(name string, n ClusterPolicyController) gpuv1.State {
 func isDaemonSetReady(name string, n ClusterPolicyController) gpuv1.State {
 	ctx := n.ctx
 	ds := &appsv1.DaemonSet{}
-	n.rec.Log.V(2).Info("checking daemonset for readiness", "name", name)
-	err := n.rec.Client.Get(ctx, types.NamespacedName{Namespace: n.operatorNamespace, Name: name}, ds)
+	n.logger.V(2).Info("checking daemonset for readiness", "name", name)
+	err := n.client.Get(ctx, types.NamespacedName{Namespace: n.operatorNamespace, Name: name}, ds)
 	if err != nil {
-		n.rec.Log.Error(err, "could not get daemonset", "name", name)
+		n.logger.Error(err, "could not get daemonset", "name", name)
+	}
+
+	if ds.Status.DesiredNumberScheduled == 0 {
+		n.logger.V(2).Info("Daemonset has desired pods of 0", "name", name)
+		return gpuv1.Ready
 	}
 
 	if ds.Status.NumberUnavailable != 0 {
-		n.rec.Log.Info("daemonset not ready", "name", name)
+		n.logger.Info("daemonset not ready", "name", name)
 		return gpuv1.NotReady
 	}
 
@@ -3125,14 +3462,14 @@ func isDaemonSetReady(name string, n ClusterPolicyController) gpuv1.State {
 
 	opts := []client.ListOption{client.MatchingLabels(ds.Spec.Template.ObjectMeta.Labels)}
 
-	n.rec.Log.V(2).Info("Pod", "LabelSelector", fmt.Sprintf("app=%s", name))
+	n.logger.V(2).Info("Pod", "LabelSelector", fmt.Sprintf("app=%s", name))
 	list := &corev1.PodList{}
-	err = n.rec.Client.List(ctx, list, opts...)
+	err = n.client.List(ctx, list, opts...)
 	if err != nil {
-		n.rec.Log.Info("Could not get PodList", err)
+		n.logger.Info("Could not get PodList", err)
 		return gpuv1.NotReady
 	}
-	n.rec.Log.V(2).Info("Pod", "NumberOfPods", len(list.Items))
+	n.logger.V(2).Info("Pod", "NumberOfPods", len(list.Items))
 	if len(list.Items) == 0 {
 		return gpuv1.NotReady
 	}
@@ -3140,20 +3477,21 @@ func isDaemonSetReady(name string, n ClusterPolicyController) gpuv1.State {
 	dsPods := getPodsOwnedbyDaemonset(ds, list.Items, n)
 	daemonsetRevisionHash, err := getDaemonsetControllerRevisionHash(ctx, ds, n)
 	if err != nil {
-		n.rec.Log.Error(
+		n.logger.Error(
 			err, "Failed to get daemonset template revision hash", "daemonset", ds)
 		return gpuv1.NotReady
 	}
-	n.rec.Log.V(2).Info("daemonset template revision hash", "hash", daemonsetRevisionHash)
+	n.logger.V(2).Info("daemonset template revision hash", "hash", daemonsetRevisionHash)
 
 	for _, pod := range dsPods {
+		pod := pod
 		podRevisionHash, err := getPodControllerRevisionHash(ctx, &pod)
 		if err != nil {
-			n.rec.Log.Error(
+			n.logger.Error(
 				err, "Failed to get pod template revision hash", "pod", pod)
 			return gpuv1.NotReady
 		}
-		n.rec.Log.V(2).Info("pod template revision hash", "hash", podRevisionHash)
+		n.logger.V(2).Info("pod template revision hash", "hash", podRevisionHash)
 
 		// check if the revision hashes are matching and pod is in running state
 		if podRevisionHash != daemonsetRevisionHash || pod.Status.Phase != "Running" {
@@ -3180,13 +3518,13 @@ func getPodsOwnedbyDaemonset(ds *appsv1.DaemonSet, pods []corev1.Pod, n ClusterP
 	dsPodList := []corev1.Pod{}
 	for _, pod := range pods {
 		if pod.OwnerReferences == nil || len(pod.OwnerReferences) < 1 {
-			n.rec.Log.Info("Driver Pod has no owner DaemonSet", "pod", pod.Name)
+			n.logger.Info("Driver Pod has no owner DaemonSet", "pod", pod.Name)
 			continue
 		}
-		n.rec.Log.V(2).Info("Pod", "pod", pod.Name, "owner", pod.OwnerReferences[0].Name)
+		n.logger.V(2).Info("Pod", "pod", pod.Name, "owner", pod.OwnerReferences[0].Name)
 
 		if ds.UID != pod.OwnerReferences[0].UID {
-			n.rec.Log.Info("Driver Pod is not owned by a Driver DaemonSet",
+			n.logger.Info("Driver Pod is not owned by a Driver DaemonSet",
 				"pod", pod, "actual owner", pod.OwnerReferences[0])
 			continue
 		}
@@ -3210,12 +3548,12 @@ func getDaemonsetControllerRevisionHash(ctx context.Context, daemonset *appsv1.D
 		client.InNamespace(n.operatorNamespace),
 	}
 	list := &appsv1.ControllerRevisionList{}
-	err := n.rec.Client.List(ctx, list, opts...)
+	err := n.client.List(ctx, list, opts...)
 	if err != nil {
 		return "", fmt.Errorf("error getting controller revision list for daemonset %s: %v", daemonset.Name, err)
 	}
 
-	n.rec.Log.V(2).Info("obtained controller revisions", "Daemonset", daemonset.Name, "len", len(list.Items))
+	n.logger.V(2).Info("obtained controller revisions", "Daemonset", daemonset.Name, "len", len(list.Items))
 
 	var revisions []appsv1.ControllerRevision
 	for _, controllerRevision := range list.Items {
@@ -3244,26 +3582,26 @@ func Deployment(n ClusterPolicyController) (gpuv1.State, error) {
 	obj := n.resources[state].Deployment.DeepCopy()
 	obj.Namespace = n.operatorNamespace
 
-	logger := n.rec.Log.WithValues("Deployment", obj.Name, "Namespace", obj.Namespace)
+	logger := n.logger.WithValues("Deployment", obj.Name, "Namespace", obj.Namespace)
 
 	// Check if state is disabled and cleanup resource if exists
 	if !n.isStateEnabled(n.stateNames[n.idx]) {
-		err := n.rec.Client.Delete(ctx, obj)
-		if err != nil && !errors.IsNotFound(err) {
+		err := n.client.Delete(ctx, obj)
+		if err != nil && !apierrors.IsNotFound(err) {
 			logger.Info("Couldn't delete", "Error", err)
 			return gpuv1.NotReady, err
 		}
 		return gpuv1.Disabled, nil
 	}
 
-	if err := controllerutil.SetControllerReference(n.singleton, obj, n.rec.Scheme); err != nil {
+	if err := controllerutil.SetControllerReference(n.singleton, obj, n.scheme); err != nil {
 		return gpuv1.NotReady, err
 	}
 
-	if err := n.rec.Client.Create(ctx, obj); err != nil {
-		if errors.IsAlreadyExists(err) {
+	if err := n.client.Create(ctx, obj); err != nil {
+		if apierrors.IsAlreadyExists(err) {
 			logger.Info("Found Resource, updating...")
-			err = n.rec.Client.Update(ctx, obj)
+			err = n.client.Update(ctx, obj)
 			if err != nil {
 				logger.Info("Couldn't update", "Error", err)
 				return gpuv1.NotReady, err
@@ -3283,21 +3621,21 @@ func ocpHasDriverToolkitImageStream(n *ClusterPolicyController) (bool, error) {
 	found := &apiimagev1.ImageStream{}
 	name := "driver-toolkit"
 	namespace := "openshift"
-	err := n.rec.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, found)
+	err := n.client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, found)
 	if err != nil {
-		if errors.IsNotFound(err) {
-			n.rec.Log.Info("ocpHasDriverToolkitImageStream: driver-toolkit imagestream not found",
+		if apierrors.IsNotFound(err) {
+			n.logger.Info("ocpHasDriverToolkitImageStream: driver-toolkit imagestream not found",
 				"Name", name,
 				"Namespace", namespace)
 
 			return false, nil
 		}
 
-		n.rec.Log.Info("Couldn't get the driver-toolkit imagestream", "Error", err)
+		n.logger.Info("Couldn't get the driver-toolkit imagestream", "Error", err)
 
 		return false, err
 	}
-	n.rec.Log.V(1).Info("ocpHasDriverToolkitImageStream: driver-toolkit imagestream found")
+	n.logger.V(1).Info("ocpHasDriverToolkitImageStream: driver-toolkit imagestream found")
 	isBroken := false
 	for _, tag := range found.Spec.Tags {
 		if tag.Name == "" {
@@ -3307,11 +3645,11 @@ func ocpHasDriverToolkitImageStream(n *ClusterPolicyController) (bool, error) {
 		if tag.Name == "latest" || tag.From == nil {
 			continue
 		}
-		n.rec.Log.V(1).Info("ocpHasDriverToolkitImageStream: tag", tag.Name, tag.From.Name)
+		n.logger.V(1).Info("ocpHasDriverToolkitImageStream: tag", tag.Name, tag.From.Name)
 		n.ocpDriverToolkit.rhcosDriverToolkitImages[tag.Name] = tag.From.Name
 	}
 	if isBroken {
-		n.rec.Log.Info("WARNING: ocpHasDriverToolkitImageStream: driver-toolkit imagestream is broken, see RHBZ#2015024")
+		n.logger.Info("WARNING: ocpHasDriverToolkitImageStream: driver-toolkit imagestream is broken, see RHBZ#2015024")
 
 		n.operatorMetrics.openshiftDriverToolkitIsBroken.Set(1)
 	} else {
@@ -3321,40 +3659,31 @@ func ocpHasDriverToolkitImageStream(n *ClusterPolicyController) (bool, error) {
 	return true, nil
 }
 
-// serviceAccountHasDockerCfg returns True if obj ServiceAccount
-// exists and has its builder-dockercfg secret reference populated.
-//
-// With OpenShift DriverToolkit, we need to ensure that this secret is
-// populated, otherwise, the Pod won't have the credentials to access
-// the DriverToolkit image in the cluster registry.
-func serviceAccountHasDockerCfg(obj *v1.ServiceAccount, n ClusterPolicyController) (bool, error) {
-	ctx := n.ctx
-	logger := n.rec.Log.WithValues("ServiceAccount", obj.Name)
-
-	err := n.rec.Client.Get(ctx, types.NamespacedName{Namespace: n.operatorNamespace, Name: obj.Name}, obj)
+func (n ClusterPolicyController) cleanupAllDriverDaemonSets(ctx context.Context) error {
+	// Get all DaemonSets owned by ClusterPolicy
+	//
+	// (cdesiniotis) There is a limitation with the controller-runtime client where only a single field selector
+	// is allowed when specifying ListOptions or DeleteOptions.
+	// See GH issue: https://github.com/kubernetes-sigs/controller-runtime/issues/612
+	list := &appsv1.DaemonSetList{}
+	err := n.client.List(ctx, list, client.MatchingFields{clusterPolicyControllerIndexKey: n.singleton.Name})
 	if err != nil {
-		if errors.IsNotFound(err) {
-			logger.Info("ServiceAccount not found",
-				"Namespace", n.operatorNamespace, "err", err)
-			return false, nil
-		}
-
-		logger.Info("Couldn't get the ServiceAccount",
-			"Name", obj.Name,
-			"Error", err)
-
-		return false, err
+		return fmt.Errorf("failed to list all NVIDIA driver daemonsets owned by ClusterPolicy: %w", err)
 	}
 
-	for _, secret := range obj.Secrets {
-		if strings.HasPrefix(secret.Name, obj.Name+"-dockercfg-") {
-			return true, nil
+	for _, ds := range list.Items {
+		ds := ds
+		// filter out DaemonSets which are not the NVIDIA driver/vgpu-manager
+		if strings.HasPrefix(ds.Name, commonDriverDaemonsetName) || strings.HasPrefix(ds.Name, commonVGPUManagerDaemonsetName) {
+			n.logger.Info("Deleting NVIDIA driver daemonset owned by ClusterPolicy", "Name", ds.Name)
+			err = n.client.Delete(ctx, &ds)
+			if err != nil {
+				return fmt.Errorf("error deleting NVIDIA driver daemonset: %w", err)
+			}
 		}
 	}
 
-	logger.Info("ServiceAccount doesn't have dockercfg secret", "Name", obj.Name)
-
-	return false, nil
+	return nil
 }
 
 // cleanupStalePrecompiledDaemonsets deletes stale driver daemonsets which can happen
@@ -3367,32 +3696,37 @@ func (n ClusterPolicyController) cleanupStalePrecompiledDaemonsets(ctx context.C
 		},
 	}
 	list := &appsv1.DaemonSetList{}
-	err := n.rec.Client.List(ctx, list, opts...)
+	err := n.client.List(ctx, list, opts...)
 	if err != nil {
-		n.rec.Log.Error(err, "could not get daemonset list")
+		n.logger.Error(err, "could not get daemonset list")
 		return err
 	}
 
 	for idx := range list.Items {
-		name := list.Items[idx].ObjectMeta.Name
-		desiredNumberScheduled := list.Items[idx].Status.DesiredNumberScheduled
+		ds := list.Items[idx]
+		name := ds.ObjectMeta.Name
+		desiredNumberScheduled := ds.Status.DesiredNumberScheduled
+		numberMisscheduled := ds.Status.NumberMisscheduled
 
-		n.rec.Log.V(1).Info("Driver DaemonSet found",
+		n.logger.V(1).Info("Driver DaemonSet found",
 			"Name", name,
-			"desiredNumberScheduled", desiredNumberScheduled)
+			"Status.DesiredNumberScheduled", desiredNumberScheduled)
 
-		if desiredNumberScheduled != 0 {
-			n.rec.Log.Info("Driver DaemonSet active, keep it.",
-				"Name", name, "Status.DesiredNumberScheduled", desiredNumberScheduled)
-			continue
-		}
+		// We consider a daemonset to be stale only if it has no desired number of pods and no pods currently mis-scheduled
+		// As per the Kubernetes docs, a daemonset pod is mis-scheduled when an already scheduled pod no longer satisfies
+		// node affinity constraints or has un-tolerated taints, for e.g. "node.kubernetes.io/unreachable:NoSchedule"
+		if desiredNumberScheduled == 0 && numberMisscheduled == 0 {
+			n.logger.Info("Delete Driver DaemonSet", "Name", name)
 
-		n.rec.Log.Info("Delete Driver DaemonSet", "Name", name)
-
-		err = n.rec.Client.Delete(ctx, &list.Items[idx])
-		if err != nil {
-			n.rec.Log.Info("ERROR: Could not get delete DaemonSet",
-				"Name", name, "Error", err)
+			err = n.client.Delete(ctx, &ds)
+			if err != nil {
+				n.logger.Error(err, "Could not get delete DaemonSet",
+					"Name", name)
+			}
+		} else {
+			n.logger.Info("Driver DaemonSet active, keep it.",
+				"Name", name,
+				"Status.DesiredNumberScheduled", desiredNumberScheduled)
 		}
 	}
 	return nil
@@ -3405,23 +3739,23 @@ func (n ClusterPolicyController) cleanupStalePrecompiledDaemonsets(ctx context.C
 func precompiledDriverDaemonsets(ctx context.Context, n ClusterPolicyController) (gpuv1.State, []error) {
 	overallState := gpuv1.Ready
 	var errs []error
-	n.rec.Log.Info("cleaning any stale precompiled driver daemonsets")
+	n.logger.Info("cleaning any stale precompiled driver daemonsets")
 	err := n.cleanupStalePrecompiledDaemonsets(ctx)
 	if err != nil {
 		return gpuv1.NotReady, append(errs, err)
 	}
 
-	n.rec.Log.V(1).Info("preparing pre-compiled driver daemonsets")
+	n.logger.V(1).Info("preparing pre-compiled driver daemonsets")
 	for kernelVersion, os := range n.kernelVersionMap {
 		// set current kernel version
 		n.currentKernelVersion = kernelVersion
 
-		n.rec.Log.Info("preparing pre-compiled driver daemonset",
+		n.logger.Info("preparing pre-compiled driver daemonset",
 			"version", n.currentKernelVersion, "os", os)
 
 		state, err := DaemonSet(n)
 		if state != gpuv1.Ready {
-			n.rec.Log.Info("pre-compiled driver daemonset not ready",
+			n.logger.Info("pre-compiled driver daemonset not ready",
 				"version", n.currentKernelVersion, "state", state)
 			overallState = state
 		}
@@ -3445,18 +3779,7 @@ func (n ClusterPolicyController) ocpDriverToolkitDaemonSets(ctx context.Context)
 		return gpuv1.NotReady, err
 	}
 
-	state := n.idx
-	saObj := n.resources[state].ServiceAccount.DeepCopy()
-	saReady, err := serviceAccountHasDockerCfg(saObj, n)
-	if err != nil {
-		return gpuv1.NotReady, err
-	}
-	if !saReady {
-		n.rec.Log.Info("Driver ServiceAccount not ready, cannot create DriverToolkit DaemonSet")
-		return gpuv1.NotReady, nil
-	}
-
-	n.rec.Log.V(1).Info("preparing DriverToolkit DaemonSet",
+	n.logger.V(1).Info("preparing DriverToolkit DaemonSet",
 		"rhcos", n.ocpDriverToolkit.rhcosVersions)
 
 	overallState := gpuv1.Ready
@@ -3465,12 +3788,12 @@ func (n ClusterPolicyController) ocpDriverToolkitDaemonSets(ctx context.Context)
 	for rhcosVersion := range n.ocpDriverToolkit.rhcosVersions {
 		n.ocpDriverToolkit.currentRhcosVersion = rhcosVersion
 
-		n.rec.Log.V(1).Info("preparing DriverToolkit DaemonSet",
+		n.logger.V(1).Info("preparing DriverToolkit DaemonSet",
 			"rhcosVersion", n.ocpDriverToolkit.currentRhcosVersion)
 
 		state, err := DaemonSet(n)
 
-		n.rec.Log.V(1).Info("preparing DriverToolkit DaemonSet",
+		n.logger.V(1).Info("preparing DriverToolkit DaemonSet",
 			"rhcosVersion", n.ocpDriverToolkit.currentRhcosVersion, "state", state)
 		if state != gpuv1.Ready {
 			overallState = state
@@ -3491,7 +3814,7 @@ func (n ClusterPolicyController) ocpDriverToolkitDaemonSets(ctx context.Context)
 		if image != "" {
 			continue
 		}
-		n.rec.Log.Info("WARNINGs: RHCOS driver-toolkit image missing. Version-specific fallback mode enabled.", "rhcosVersion", rhcosVersion)
+		n.logger.Info("WARNINGs: RHCOS driver-toolkit image missing. Version-specific fallback mode enabled.", "rhcosVersion", rhcosVersion)
 		tagsMissing = true
 	}
 	if tagsMissing {
@@ -3518,9 +3841,9 @@ func (n ClusterPolicyController) ocpCleanupStaleDriverToolkitDaemonSets(ctx cont
 	}
 
 	list := &appsv1.DaemonSetList{}
-	err := n.rec.Client.List(ctx, list, opts...)
+	err := n.client.List(ctx, list, opts...)
 	if err != nil {
-		n.rec.Log.Info("ERROR: Could not get DaemonSetList", "Error", err)
+		n.logger.Info("ERROR: Could not get DaemonSetList", "Error", err)
 		return err
 	}
 
@@ -3530,29 +3853,30 @@ func (n ClusterPolicyController) ocpCleanupStaleDriverToolkitDaemonSets(ctx cont
 		clusterHasRhcosVersion, clusterOk := n.ocpDriverToolkit.rhcosVersions[dsRhcosVersion]
 		desiredNumberScheduled := list.Items[idx].Status.DesiredNumberScheduled
 
-		n.rec.Log.V(1).Info("Driver DaemonSet found",
+		n.logger.V(1).Info("Driver DaemonSet found",
 			"Name", name,
 			"dsRhcosVersion", dsRhcosVersion,
 			"clusterHasRhcosVersion", clusterHasRhcosVersion,
 			"desiredNumberScheduled", desiredNumberScheduled)
 
 		if desiredNumberScheduled != 0 {
-			n.rec.Log.Info("Driver DaemonSet active, keep it.",
+			n.logger.Info("Driver DaemonSet active, keep it.",
 				"Name", name, "Status.DesiredNumberScheduled", desiredNumberScheduled)
 			continue
 		}
 
 		if !versionOk {
-			n.rec.Log.Info("WARNING: Driver DaemonSet doesn't have DriverToolkit version label",
+			n.logger.Info("WARNING: Driver DaemonSet doesn't have DriverToolkit version label",
 				"Name", name, "Label", ocpDriverToolkitVersionLabel,
 			)
 		} else {
-			if !clusterOk {
-				n.rec.Log.V(1).Info("Driver DaemonSet RHCOS version NOT part of the cluster",
+			switch {
+			case !clusterOk:
+				n.logger.V(1).Info("Driver DaemonSet RHCOS version NOT part of the cluster",
 					"Name", name, "RHCOS version", dsRhcosVersion,
 				)
-			} else if clusterHasRhcosVersion {
-				n.rec.Log.V(1).Info("Driver DaemonSet RHCOS version is part of the cluster, keep it.",
+			case clusterHasRhcosVersion:
+				n.logger.V(1).Info("Driver DaemonSet RHCOS version is part of the cluster, keep it.",
 					"Name", name, "RHCOS version", dsRhcosVersion,
 				)
 
@@ -3560,18 +3884,18 @@ func (n ClusterPolicyController) ocpCleanupStaleDriverToolkitDaemonSets(ctx cont
 				// keep it alive
 
 				continue
-			} else /* clusterHasRhcosVersion == false */ {
+			default: /* clusterHasRhcosVersion == false */
 				// currently unexpected
-				n.rec.Log.V(1).Info("Driver DaemonSet RHCOS version marked for deletion",
+				n.logger.V(1).Info("Driver DaemonSet RHCOS version marked for deletion",
 					"Name", name, "RHCOS version", dsRhcosVersion,
 				)
 			}
 		}
 
-		n.rec.Log.Info("Delete Driver DaemonSet", "Name", name)
-		err = n.rec.Client.Delete(ctx, &list.Items[idx])
+		n.logger.Info("Delete Driver DaemonSet", "Name", name)
+		err = n.client.Delete(ctx, &list.Items[idx])
 		if err != nil {
-			n.rec.Log.Info("ERROR: Could not get delete DaemonSet",
+			n.logger.Info("ERROR: Could not get delete DaemonSet",
 				"Name", name, "Error", err)
 			return err
 		}
@@ -3622,7 +3946,8 @@ func (n ClusterPolicyController) cleanupUnusedVGPUManagerDaemonsets(ctx context.
 func (n ClusterPolicyController) cleanupUnusedDriverDaemonSets(ctx context.Context) (int, error) {
 	podCount := 0
 	if n.openshift != "" {
-		if n.singleton.Spec.Driver.UsePrecompiledDrivers() {
+		switch {
+		case n.singleton.Spec.Driver.UsePrecompiledDrivers():
 			// cleanup DTK daemonsets
 			count, err := n.cleanupDriverDaemonsets(ctx,
 				ocpDriverToolkitIdentificationLabel,
@@ -3639,7 +3964,8 @@ func (n ClusterPolicyController) cleanupUnusedDriverDaemonSets(ctx context.Conte
 				return 0, err
 			}
 			podCount += count
-		} else if n.ocpDriverToolkit.enabled {
+
+		case n.ocpDriverToolkit.enabled:
 			// cleanup pre-compiled and legacy driver daemonsets
 			count, err := n.cleanupDriverDaemonsets(ctx,
 				appLabelKey,
@@ -3648,7 +3974,7 @@ func (n ClusterPolicyController) cleanupUnusedDriverDaemonSets(ctx context.Conte
 				return 0, err
 			}
 			podCount = count
-		} else {
+		default:
 			// cleanup pre-compiled
 			count, err := n.cleanupDriverDaemonsets(ctx,
 				precompiledIdentificationLabelKey,
@@ -3698,22 +4024,22 @@ func (n ClusterPolicyController) cleanupDriverDaemonsets(ctx context.Context, se
 	var opts = []client.ListOption{client.MatchingLabels{searchKey: searchValue}}
 
 	dsList := &appsv1.DaemonSetList{}
-	if err := n.rec.Client.List(ctx, dsList, opts...); err != nil {
-		n.rec.Log.Error(err, "Could not get DaemonSetList")
+	if err := n.client.List(ctx, dsList, opts...); err != nil {
+		n.logger.Error(err, "Could not get DaemonSetList")
 		return 0, err
 	}
 
 	var lastErr error
 	for idx := range dsList.Items {
-		n.rec.Log.Info("Delete DaemonSet",
+		n.logger.Info("Delete DaemonSet",
 			"Name", dsList.Items[idx].ObjectMeta.Name,
 		)
 		// ignore daemonsets that doesn't match the required name
 		if !strings.HasPrefix(dsList.Items[idx].ObjectMeta.Name, namePrefix) {
 			continue
 		}
-		if err := n.rec.Client.Delete(ctx, &dsList.Items[idx]); err != nil {
-			n.rec.Log.Error(err, "Could not get delete DaemonSet",
+		if err := n.client.Delete(ctx, &dsList.Items[idx]); err != nil {
+			n.logger.Error(err, "Could not get delete DaemonSet",
 				"Name", dsList.Items[idx].ObjectMeta.Name)
 			lastErr = err
 		}
@@ -3725,8 +4051,8 @@ func (n ClusterPolicyController) cleanupDriverDaemonsets(ctx context.Context, se
 	}
 
 	podList := &corev1.PodList{}
-	if err := n.rec.Client.List(ctx, podList, opts...); err != nil {
-		n.rec.Log.Info("ERROR: Could not get PodList", "Error", err)
+	if err := n.client.List(ctx, podList, opts...); err != nil {
+		n.logger.Info("ERROR: Could not get PodList", "Error", err)
 		return 0, err
 	}
 
@@ -3748,12 +4074,12 @@ func DaemonSet(n ClusterPolicyController) (gpuv1.State, error) {
 	obj := n.resources[state].DaemonSet.DeepCopy()
 	obj.Namespace = n.operatorNamespace
 
-	logger := n.rec.Log.WithValues("DaemonSet", obj.Name, "Namespace", obj.Namespace)
+	logger := n.logger.WithValues("DaemonSet", obj.Name, "Namespace", obj.Namespace)
 
 	// Check if state is disabled and cleanup resource if exists
 	if !n.isStateEnabled(n.stateNames[n.idx]) {
-		err := n.rec.Client.Delete(ctx, obj)
-		if err != nil && !errors.IsNotFound(err) {
+		err := n.client.Delete(ctx, obj)
+		if err != nil && !apierrors.IsNotFound(err) {
 			logger.Info("Couldn't delete", "Error", err)
 			return gpuv1.NotReady, err
 		}
@@ -3826,7 +4152,7 @@ func DaemonSet(n ClusterPolicyController) (gpuv1.State, error) {
 		return gpuv1.NotReady, err
 	}
 
-	if err := controllerutil.SetControllerReference(n.singleton, obj, n.rec.Scheme); err != nil {
+	if err := controllerutil.SetControllerReference(n.singleton, obj, n.scheme); err != nil {
 		logger.Info("SetControllerReference failed", "Error", err)
 		return gpuv1.NotReady, err
 	}
@@ -3849,8 +4175,8 @@ func DaemonSet(n ClusterPolicyController) (gpuv1.State, error) {
 	}
 
 	found := &appsv1.DaemonSet{}
-	err = n.rec.Client.Get(ctx, types.NamespacedName{Namespace: obj.Namespace, Name: obj.Name}, found)
-	if err != nil && errors.IsNotFound(err) {
+	err = n.client.Get(ctx, types.NamespacedName{Namespace: obj.Namespace, Name: obj.Name}, found)
+	if err != nil && apierrors.IsNotFound(err) {
 		logger.Info("DaemonSet not found, creating",
 			"Name", obj.Name,
 		)
@@ -3858,7 +4184,7 @@ func DaemonSet(n ClusterPolicyController) (gpuv1.State, error) {
 		hashStr := getDaemonsetHash(obj)
 		// add annotation to the Daemonset with hash value during creation
 		obj.Annotations[NvidiaAnnotationHashKey] = hashStr
-		err = n.rec.Client.Create(ctx, obj)
+		err = n.client.Create(ctx, obj)
 		if err != nil {
 			logger.Info("Couldn't create DaemonSet",
 				"Name", obj.Name,
@@ -3877,7 +4203,7 @@ func DaemonSet(n ClusterPolicyController) (gpuv1.State, error) {
 	changed := isDaemonsetSpecChanged(found, obj)
 	if changed {
 		logger.Info("DaemonSet is different, updating", "name", obj.ObjectMeta.Name)
-		err = n.rec.Client.Update(ctx, obj)
+		err = n.client.Update(ctx, obj)
 		if err != nil {
 			return gpuv1.NotReady, err
 		}
@@ -3888,11 +4214,15 @@ func DaemonSet(n ClusterPolicyController) (gpuv1.State, error) {
 }
 
 func getDaemonsetHash(daemonset *appsv1.DaemonSet) string {
-	hash, err := hashstructure.Hash(daemonset, nil)
-	if err != nil {
-		panic(err.Error())
+	hasher := fnv.New32a()
+	printer := spew.ConfigState{
+		Indent:         " ",
+		SortKeys:       true,
+		DisableMethods: true,
+		SpewKeys:       true,
 	}
-	return strconv.FormatUint(hash, 16)
+	printer.Fprintf(hasher, "%#v", daemonset)
+	return fmt.Sprint(hasher.Sum32())
 }
 
 // isDaemonsetSpecChanged returns true if the spec has changed between existing one
@@ -3936,13 +4266,13 @@ func isPodReady(name string, n ClusterPolicyController, phase corev1.PodPhase) g
 	ctx := n.ctx
 	opts := []client.ListOption{&client.MatchingLabels{"app": name}}
 
-	n.rec.Log.V(1).Info("Pod", "LabelSelector", fmt.Sprintf("app=%s", name))
+	n.logger.V(1).Info("Pod", "LabelSelector", fmt.Sprintf("app=%s", name))
 	list := &corev1.PodList{}
-	err := n.rec.Client.List(ctx, list, opts...)
+	err := n.client.List(ctx, list, opts...)
 	if err != nil {
-		n.rec.Log.Info("Could not get PodList", err)
+		n.logger.Info("Could not get PodList", err)
 	}
-	n.rec.Log.V(1).Info("Pod", "NumberOfPods", len(list.Items))
+	n.logger.V(1).Info("Pod", "NumberOfPods", len(list.Items))
 	if len(list.Items) == 0 {
 		return gpuv1.NotReady
 	}
@@ -3950,10 +4280,10 @@ func isPodReady(name string, n ClusterPolicyController, phase corev1.PodPhase) g
 	pd := list.Items[0]
 
 	if pd.Status.Phase != phase {
-		n.rec.Log.V(1).Info("Pod", "Phase", pd.Status.Phase, "!=", phase)
+		n.logger.V(1).Info("Pod", "Phase", pd.Status.Phase, "!=", phase)
 		return gpuv1.NotReady
 	}
-	n.rec.Log.V(1).Info("Pod", "Phase", pd.Status.Phase, "==", phase)
+	n.logger.V(1).Info("Pod", "Phase", pd.Status.Phase, "==", phase)
 	return gpuv1.Ready
 }
 
@@ -3964,12 +4294,12 @@ func SecurityContextConstraints(n ClusterPolicyController) (gpuv1.State, error) 
 	obj := n.resources[state].SecurityContextConstraints.DeepCopy()
 	obj.Namespace = n.operatorNamespace
 
-	logger := n.rec.Log.WithValues("SecurityContextConstraints", obj.Name, "Namespace", "default")
+	logger := n.logger.WithValues("SecurityContextConstraints", obj.Name, "Namespace", "default")
 
 	// Check if state is disabled and cleanup resource if exists
 	if !n.isStateEnabled(n.stateNames[n.idx]) {
-		err := n.rec.Client.Delete(ctx, obj)
-		if err != nil && !errors.IsNotFound(err) {
+		err := n.client.Delete(ctx, obj)
+		if err != nil && !apierrors.IsNotFound(err) {
 			logger.Info("Couldn't delete", "Error", err)
 			return gpuv1.NotReady, err
 		}
@@ -3983,20 +4313,15 @@ func SecurityContextConstraints(n ClusterPolicyController) (gpuv1.State, error) 
 		obj.Users[idx] = fmt.Sprintf("system:serviceaccount:%s:%s", obj.Namespace, obj.Name)
 	}
 
-	// Allow hostNetwork only when a separate standalone DCGM engine is deployed for communication
-	if obj.Name == "nvidia-dcgm-exporter" && n.singleton.Spec.DCGM.IsEnabled() {
-		obj.AllowHostNetwork = true
-	}
-
-	if err := controllerutil.SetControllerReference(n.singleton, obj, n.rec.Scheme); err != nil {
+	if err := controllerutil.SetControllerReference(n.singleton, obj, n.scheme); err != nil {
 		return gpuv1.NotReady, err
 	}
 
 	found := &secv1.SecurityContextConstraints{}
-	err := n.rec.Client.Get(ctx, types.NamespacedName{Namespace: "", Name: obj.Name}, found)
-	if err != nil && errors.IsNotFound(err) {
+	err := n.client.Get(ctx, types.NamespacedName{Namespace: "", Name: obj.Name}, found)
+	if err != nil && apierrors.IsNotFound(err) {
 		logger.Info("Not found, creating...")
-		err = n.rec.Client.Create(ctx, obj)
+		err = n.client.Create(ctx, obj)
 		if err != nil {
 			logger.Info("Couldn't create", "Error", err)
 			return gpuv1.NotReady, err
@@ -4009,55 +4334,7 @@ func SecurityContextConstraints(n ClusterPolicyController) (gpuv1.State, error) 
 	logger.Info("Found Resource, updating...")
 	obj.ResourceVersion = found.ResourceVersion
 
-	err = n.rec.Client.Update(ctx, obj)
-	if err != nil {
-		logger.Info("Couldn't update", "Error", err)
-		return gpuv1.NotReady, err
-	}
-	return gpuv1.Ready, nil
-}
-
-// PodSecurityPolicy creates PSP resources
-func PodSecurityPolicy(n ClusterPolicyController) (gpuv1.State, error) {
-	ctx := n.ctx
-	state := n.idx
-	obj := n.resources[state].PodSecurityPolicy.DeepCopy()
-	obj.Namespace = n.operatorNamespace
-
-	logger := n.rec.Log.WithValues("PodSecurityPolicies", obj.Name)
-
-	// Check if PSP is disabled and cleanup resource if exists
-	if !n.singleton.Spec.PSP.IsEnabled() {
-		err := n.rec.Client.Delete(ctx, obj)
-		if err != nil && !errors.IsNotFound(err) {
-			logger.Info("Couldn't delete", "Error", err)
-			return gpuv1.NotReady, err
-		}
-		return gpuv1.Ready, nil
-	}
-
-	if err := controllerutil.SetControllerReference(n.singleton, obj, n.rec.Scheme); err != nil {
-		return gpuv1.NotReady, err
-	}
-
-	found := &policyv1beta1.PodSecurityPolicy{}
-	err := n.rec.Client.Get(ctx, types.NamespacedName{Namespace: "", Name: obj.Name}, found)
-	if err != nil && errors.IsNotFound(err) {
-		logger.Info("Not found, creating...")
-		err = n.rec.Client.Create(ctx, obj)
-		if err != nil {
-			logger.Info("Couldn't create", "Error", err)
-			return gpuv1.NotReady, err
-		}
-		return gpuv1.Ready, nil
-	} else if err != nil {
-		return gpuv1.NotReady, err
-	}
-
-	logger.Info("Found Resource, updating...")
-	obj.ResourceVersion = found.ResourceVersion
-
-	err = n.rec.Client.Update(ctx, obj)
+	err = n.client.Update(ctx, obj)
 	if err != nil {
 		logger.Info("Couldn't update", "Error", err)
 		return gpuv1.NotReady, err
@@ -4073,27 +4350,27 @@ func Service(n ClusterPolicyController) (gpuv1.State, error) {
 
 	obj.Namespace = n.operatorNamespace
 
-	logger := n.rec.Log.WithValues("Service", obj.Name, "Namespace", obj.Namespace)
+	logger := n.logger.WithValues("Service", obj.Name, "Namespace", obj.Namespace)
 
 	// Check if state is disabled and cleanup resource if exists
 	if !n.isStateEnabled(n.stateNames[n.idx]) {
-		err := n.rec.Client.Delete(ctx, obj)
-		if err != nil && !errors.IsNotFound(err) {
+		err := n.client.Delete(ctx, obj)
+		if err != nil && !apierrors.IsNotFound(err) {
 			logger.Info("Couldn't delete", "Error", err)
 			return gpuv1.NotReady, err
 		}
 		return gpuv1.Disabled, nil
 	}
 
-	if err := controllerutil.SetControllerReference(n.singleton, obj, n.rec.Scheme); err != nil {
+	if err := controllerutil.SetControllerReference(n.singleton, obj, n.scheme); err != nil {
 		return gpuv1.NotReady, err
 	}
 
 	found := &corev1.Service{}
-	err := n.rec.Client.Get(ctx, types.NamespacedName{Namespace: obj.Namespace, Name: obj.Name}, found)
-	if err != nil && errors.IsNotFound(err) {
+	err := n.client.Get(ctx, types.NamespacedName{Namespace: obj.Namespace, Name: obj.Name}, found)
+	if err != nil && apierrors.IsNotFound(err) {
 		logger.Info("Not found, creating...")
-		err = n.rec.Client.Create(ctx, obj)
+		err = n.client.Create(ctx, obj)
 		if err != nil {
 			logger.Info("Couldn't create", "Error", err)
 			return gpuv1.NotReady, err
@@ -4107,7 +4384,7 @@ func Service(n ClusterPolicyController) (gpuv1.State, error) {
 	obj.ResourceVersion = found.ResourceVersion
 	obj.Spec.ClusterIP = found.Spec.ClusterIP
 
-	err = n.rec.Client.Update(ctx, obj)
+	err = n.client.Update(ctx, obj)
 	if err != nil {
 		logger.Info("Couldn't update", "Error", err)
 		return gpuv1.NotReady, err
@@ -4117,8 +4394,8 @@ func Service(n ClusterPolicyController) (gpuv1.State, error) {
 
 func crdExists(n ClusterPolicyController, name string) (bool, error) {
 	crd := &apiextensionsv1.CustomResourceDefinition{}
-	err := n.rec.Client.Get(n.ctx, client.ObjectKey{Name: name}, crd)
-	if err != nil && errors.IsNotFound(err) {
+	err := n.client.Get(n.ctx, client.ObjectKey{Name: name}, crd)
+	if err != nil && apierrors.IsNotFound(err) {
 		return false, nil
 	} else if err != nil {
 		return false, err
@@ -4134,7 +4411,7 @@ func ServiceMonitor(n ClusterPolicyController) (gpuv1.State, error) {
 	obj := n.resources[state].ServiceMonitor.DeepCopy()
 	obj.Namespace = n.operatorNamespace
 
-	logger := n.rec.Log.WithValues("ServiceMonitor", obj.Name, "Namespace", obj.Namespace)
+	logger := n.logger.WithValues("ServiceMonitor", obj.Name, "Namespace", obj.Namespace)
 
 	// Check if ServiceMonitor is a valid kind
 	serviceMonitorCRDExists, err := crdExists(n, ServiceMonitorCRDName)
@@ -4147,8 +4424,8 @@ func ServiceMonitor(n ClusterPolicyController) (gpuv1.State, error) {
 		if !serviceMonitorCRDExists {
 			return gpuv1.Ready, nil
 		}
-		err := n.rec.Client.Delete(ctx, obj)
-		if err != nil && !errors.IsNotFound(err) {
+		err := n.client.Delete(ctx, obj)
+		if err != nil && !apierrors.IsNotFound(err) {
 			logger.Info("Couldn't delete", "Error", err)
 			return gpuv1.NotReady, err
 		}
@@ -4162,8 +4439,8 @@ func ServiceMonitor(n ClusterPolicyController) (gpuv1.State, error) {
 			if !serviceMonitorCRDExists {
 				return gpuv1.Ready, nil
 			}
-			err := n.rec.Client.Delete(ctx, obj)
-			if err != nil && !errors.IsNotFound(err) {
+			err := n.client.Delete(ctx, obj)
+			if err != nil && !apierrors.IsNotFound(err) {
 				logger.Info("Couldn't delete", "Error", err)
 				return gpuv1.NotReady, err
 			}
@@ -4210,15 +4487,15 @@ func ServiceMonitor(n ClusterPolicyController) (gpuv1.State, error) {
 		obj.Spec.NamespaceSelector.MatchNames[idx] = obj.Namespace
 	}
 
-	if err := controllerutil.SetControllerReference(n.singleton, obj, n.rec.Scheme); err != nil {
+	if err := controllerutil.SetControllerReference(n.singleton, obj, n.scheme); err != nil {
 		return gpuv1.NotReady, err
 	}
 
 	found := &promv1.ServiceMonitor{}
-	err = n.rec.Client.Get(ctx, types.NamespacedName{Namespace: obj.Namespace, Name: obj.Name}, found)
-	if err != nil && errors.IsNotFound(err) {
+	err = n.client.Get(ctx, types.NamespacedName{Namespace: obj.Namespace, Name: obj.Name}, found)
+	if err != nil && apierrors.IsNotFound(err) {
 		logger.Info("Not found, creating...")
-		err = n.rec.Client.Create(ctx, obj)
+		err = n.client.Create(ctx, obj)
 		if err != nil {
 			logger.Info("Couldn't create", "Error", err)
 			return gpuv1.NotReady, err
@@ -4231,7 +4508,7 @@ func ServiceMonitor(n ClusterPolicyController) (gpuv1.State, error) {
 	logger.Info("Found Resource, updating...")
 	obj.ResourceVersion = found.ResourceVersion
 
-	err = n.rec.Client.Update(ctx, obj)
+	err = n.client.Update(ctx, obj)
 	if err != nil {
 		logger.Info("Couldn't update", "Error", err)
 		return gpuv1.NotReady, err
@@ -4255,17 +4532,17 @@ func transformRuntimeClassLegacy(n ClusterPolicyController, spec nodev1.RuntimeC
 
 	obj.Labels = spec.Labels
 
-	logger := n.rec.Log.WithValues("RuntimeClass", obj.Name)
+	logger := n.logger.WithValues("RuntimeClass", obj.Name)
 
-	if err := controllerutil.SetControllerReference(n.singleton, obj, n.rec.Scheme); err != nil {
+	if err := controllerutil.SetControllerReference(n.singleton, obj, n.scheme); err != nil {
 		return gpuv1.NotReady, err
 	}
 
 	found := &nodev1beta1.RuntimeClass{}
-	err := n.rec.Client.Get(ctx, types.NamespacedName{Namespace: "", Name: obj.Name}, found)
-	if err != nil && errors.IsNotFound(err) {
+	err := n.client.Get(ctx, types.NamespacedName{Namespace: "", Name: obj.Name}, found)
+	if err != nil && apierrors.IsNotFound(err) {
 		logger.Info("Not found, creating...")
-		err = n.rec.Client.Create(ctx, obj)
+		err = n.client.Create(ctx, obj)
 		if err != nil {
 			logger.Info("Couldn't create", "Error", err)
 			return gpuv1.NotReady, err
@@ -4278,7 +4555,7 @@ func transformRuntimeClassLegacy(n ClusterPolicyController, spec nodev1.RuntimeC
 	logger.Info("Found Resource, updating...")
 	obj.ResourceVersion = found.ResourceVersion
 
-	err = n.rec.Client.Update(ctx, obj)
+	err = n.client.Update(ctx, obj)
 	if err != nil {
 		logger.Info("Couldn't update", "Error", err)
 		return gpuv1.NotReady, err
@@ -4302,17 +4579,17 @@ func transformRuntimeClass(n ClusterPolicyController, spec nodev1.RuntimeClass) 
 
 	obj.Labels = spec.Labels
 
-	logger := n.rec.Log.WithValues("RuntimeClass", obj.Name)
+	logger := n.logger.WithValues("RuntimeClass", obj.Name)
 
-	if err := controllerutil.SetControllerReference(n.singleton, obj, n.rec.Scheme); err != nil {
+	if err := controllerutil.SetControllerReference(n.singleton, obj, n.scheme); err != nil {
 		return gpuv1.NotReady, err
 	}
 
 	found := &nodev1.RuntimeClass{}
-	err := n.rec.Client.Get(ctx, types.NamespacedName{Namespace: "", Name: obj.Name}, found)
-	if err != nil && errors.IsNotFound(err) {
+	err := n.client.Get(ctx, types.NamespacedName{Namespace: "", Name: obj.Name}, found)
+	if err != nil && apierrors.IsNotFound(err) {
 		logger.Info("Not found, creating...")
-		err = n.rec.Client.Create(ctx, obj)
+		err = n.client.Create(ctx, obj)
 		if err != nil {
 			logger.Info("Couldn't create", "Error", err)
 			return gpuv1.NotReady, err
@@ -4325,7 +4602,7 @@ func transformRuntimeClass(n ClusterPolicyController, spec nodev1.RuntimeClass) 
 	logger.Info("Found Resource, updating...")
 	obj.ResourceVersion = found.ResourceVersion
 
-	err = n.rec.Client.Update(ctx, obj)
+	err = n.client.Update(ctx, obj)
 	if err != nil {
 		logger.Info("Couldn't update", "Error", err)
 		return gpuv1.NotReady, err
@@ -4341,19 +4618,20 @@ func transformKataRuntimeClasses(n ClusterPolicyController) (gpuv1.State, error)
 	// Get all existing Kata RuntimeClasses
 	opts := []client.ListOption{&client.MatchingLabels{"nvidia.com/kata-runtime-class": "true"}}
 	list := &nodev1.RuntimeClassList{}
-	err := n.rec.Client.List(ctx, list, opts...)
+	err := n.client.List(ctx, list, opts...)
 	if err != nil {
-		n.rec.Log.Info("Could not get Kata RuntimeClassList", err)
+		n.logger.Info("Could not get Kata RuntimeClassList", err)
 		return gpuv1.NotReady, fmt.Errorf("error getting kata RuntimeClassList: %v", err)
 	}
-	n.rec.Log.V(1).Info("Kata RuntimeClasses", "Number", len(list.Items))
+	n.logger.V(1).Info("Kata RuntimeClasses", "Number", len(list.Items))
 
 	if !config.KataManager.IsEnabled() {
 		// Delete all Kata RuntimeClasses
-		n.rec.Log.Info("Kata Manager disabled, deleting all Kata RuntimeClasses")
+		n.logger.Info("Kata Manager disabled, deleting all Kata RuntimeClasses")
 		for _, rc := range list.Items {
-			n.rec.Log.V(1).Info("Deleting Kata RuntimeClass", "Name", rc.Name)
-			err := n.rec.Client.Delete(ctx, &rc)
+			rc := rc
+			n.logger.V(1).Info("Deleting Kata RuntimeClass", "Name", rc.Name)
+			err := n.client.Delete(ctx, &rc)
 			if err != nil {
 				return gpuv1.NotReady, fmt.Errorf("error deleting kata RuntimeClass '%s': %v", rc.Name, err)
 			}
@@ -4370,8 +4648,9 @@ func transformKataRuntimeClasses(n ClusterPolicyController) (gpuv1.State, error)
 	// Delete any existing Kata RuntimeClasses that are no longer specified in KataManager configuration
 	for _, rc := range list.Items {
 		if _, ok := rcNames[rc.Name]; !ok {
-			n.rec.Log.Info("Deleting Kata RuntimeClass", "Name", rc.Name)
-			err := n.rec.Client.Delete(ctx, &rc)
+			rc := rc
+			n.logger.Info("Deleting Kata RuntimeClass", "Name", rc.Name)
+			err := n.client.Delete(ctx, &rc)
 			if err != nil {
 				return gpuv1.NotReady, fmt.Errorf("error deleting kata RuntimeClass '%s': %v", rc.Name, err)
 			}
@@ -4381,14 +4660,21 @@ func transformKataRuntimeClasses(n ClusterPolicyController) (gpuv1.State, error)
 	// Using kata RuntimClass template, create / update RuntimeClass objects specified in KataManager configuration
 	template := n.resources[state].RuntimeClasses[0]
 	for _, rc := range config.KataManager.Config.RuntimeClasses {
-		logger := n.rec.Log.WithValues("RuntimeClass", rc.Name)
+		logger := n.logger.WithValues("RuntimeClass", rc.Name)
+
+		if rc.Name == config.Operator.RuntimeClass {
+			return gpuv1.NotReady, fmt.Errorf("error creating kata runtimeclass '%s' as it conflicts with the runtimeclass used for the gpu-operator operand pods itself", rc.Name)
+		}
 
 		obj := nodev1.RuntimeClass{}
 		obj.Name = rc.Name
 		obj.Handler = rc.Name
 		obj.Labels = template.Labels
 		obj.Scheduling = &nodev1.Scheduling{}
-		nodeSelector := template.Scheduling.NodeSelector
+		nodeSelector := make(map[string]string)
+		for k, v := range template.Scheduling.NodeSelector {
+			nodeSelector[k] = v
+		}
 		if rc.NodeSelector != nil {
 			// append user provided selectors to default nodeSelector
 			for k, v := range rc.NodeSelector {
@@ -4397,15 +4683,15 @@ func transformKataRuntimeClasses(n ClusterPolicyController) (gpuv1.State, error)
 		}
 		obj.Scheduling.NodeSelector = nodeSelector
 
-		if err := controllerutil.SetControllerReference(n.singleton, &obj, n.rec.Scheme); err != nil {
+		if err := controllerutil.SetControllerReference(n.singleton, &obj, n.scheme); err != nil {
 			return gpuv1.NotReady, err
 		}
 
 		found := &nodev1.RuntimeClass{}
-		err := n.rec.Client.Get(ctx, types.NamespacedName{Namespace: "", Name: obj.Name}, found)
-		if err != nil && errors.IsNotFound(err) {
+		err := n.client.Get(ctx, types.NamespacedName{Namespace: "", Name: obj.Name}, found)
+		if err != nil && apierrors.IsNotFound(err) {
 			logger.Info("Not found, creating...")
-			err = n.rec.Client.Create(ctx, &obj)
+			err = n.client.Create(ctx, &obj)
 			if err != nil {
 				logger.Info("Couldn't create", "Error", err)
 				return gpuv1.NotReady, err
@@ -4418,7 +4704,7 @@ func transformKataRuntimeClasses(n ClusterPolicyController) (gpuv1.State, error)
 		logger.Info("Found Resource, updating...")
 		obj.ResourceVersion = found.ResourceVersion
 
-		err = n.rec.Client.Update(ctx, &obj)
+		err = n.client.Update(ctx, &obj)
 		if err != nil {
 			logger.Info("Couldn't update", "Error", err)
 			return gpuv1.NotReady, err
@@ -4441,13 +4727,14 @@ func RuntimeClasses(n ClusterPolicyController) (gpuv1.State, error) {
 	}
 
 	for _, obj := range n.resources[state].RuntimeClasses {
+		obj := obj
 		// When CDI is disabled, do not create the additional 'nvidia-cdi' and
 		// 'nvidia-legacy' runtime classes. Delete these objects if they were
 		// previously created.
 		if !n.singleton.Spec.CDI.IsEnabled() && (obj.Name == "nvidia-cdi" || obj.Name == "nvidia-legacy") {
-			err := n.rec.Client.Delete(context.TODO(), &obj)
-			if err != nil && !errors.IsNotFound(err) {
-				n.rec.Log.Info("Couldn't delete", "RuntimeClass", obj.Name, "Error", err)
+			err := n.client.Delete(n.ctx, &obj)
+			if err != nil && !apierrors.IsNotFound(err) {
+				n.logger.Info("Couldn't delete", "RuntimeClass", obj.Name, "Error", err)
 				return gpuv1.NotReady, err
 			}
 			continue
@@ -4470,17 +4757,17 @@ func PrometheusRule(n ClusterPolicyController) (gpuv1.State, error) {
 	obj := n.resources[state].PrometheusRule.DeepCopy()
 	obj.Namespace = n.operatorNamespace
 
-	logger := n.rec.Log.WithValues("PrometheusRule", obj.Name)
+	logger := n.logger.WithValues("PrometheusRule", obj.Name)
 
-	if err := controllerutil.SetControllerReference(n.singleton, obj, n.rec.Scheme); err != nil {
+	if err := controllerutil.SetControllerReference(n.singleton, obj, n.scheme); err != nil {
 		return gpuv1.NotReady, err
 	}
 
 	found := &promv1.PrometheusRule{}
-	err := n.rec.Client.Get(ctx, types.NamespacedName{Namespace: obj.Namespace, Name: obj.Name}, found)
-	if err != nil && errors.IsNotFound(err) {
+	err := n.client.Get(ctx, types.NamespacedName{Namespace: obj.Namespace, Name: obj.Name}, found)
+	if err != nil && apierrors.IsNotFound(err) {
 		logger.Info("Not found, creating...")
-		err = n.rec.Client.Create(ctx, obj)
+		err = n.client.Create(ctx, obj)
 		if err != nil {
 			logger.Info("Couldn't create", "Error", err)
 			return gpuv1.NotReady, err
@@ -4493,7 +4780,7 @@ func PrometheusRule(n ClusterPolicyController) (gpuv1.State, error) {
 	logger.Info("Found Resource, updating...")
 	obj.ResourceVersion = found.ResourceVersion
 
-	err = n.rec.Client.Update(ctx, obj)
+	err = n.client.Update(ctx, obj)
 	if err != nil {
 		logger.Info("Couldn't update", "Error", err)
 		return gpuv1.NotReady, err

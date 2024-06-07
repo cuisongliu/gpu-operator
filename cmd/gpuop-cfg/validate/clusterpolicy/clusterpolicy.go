@@ -21,10 +21,11 @@ import (
 	"io"
 	"os"
 
-	v1 "github.com/NVIDIA/gpu-operator/api/v1"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
 	"sigs.k8s.io/yaml"
+
+	v1 "github.com/NVIDIA/gpu-operator/api/nvidia/v1"
 )
 
 type command struct {
@@ -81,7 +82,7 @@ func (m command) run(c *cli.Context, opts *options) error {
 		return fmt.Errorf("failed to load clusterpolicy spec: %v", err)
 	}
 
-	err = validateImages(&cp.Spec)
+	err = validateImages(c.Context, &cp.Spec)
 	if err != nil {
 		return fmt.Errorf("failed to validate images: %v", err)
 	}

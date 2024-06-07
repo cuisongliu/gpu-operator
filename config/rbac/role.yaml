@@ -2,7 +2,6 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  creationTimestamp: null
   name: gpu-operator-role
 rules:
 - apiGroups:
@@ -55,6 +54,14 @@ rules:
   - pods
   verbs:
   - list
+- apiGroups:
+  - apiextensions.k8s.io
+  resources:
+  - customresourcedefinitions
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - apps
   resources:
@@ -127,13 +134,25 @@ rules:
 - apiGroups:
   - monitoring.coreos.com
   resources:
-  - prometheusrule
+  - prometheusrules
   - servicemonitors
   verbs:
   - create
+  - delete
   - get
   - list
   - patch
+  - update
+  - watch
+- apiGroups:
+  - node.k8s.io
+  resources:
+  - runtimeclasses
+  verbs:
+  - create
+  - delete
+  - get
+  - list
   - update
   - watch
 - apiGroups:
@@ -149,12 +168,9 @@ rules:
   - update
   - watch
 - apiGroups:
-  - rbac.authorization.k8s.io
+  - nvidia.com
   resources:
-  - clusterrolebindings
-  - clusterroles
-  - rolebindings
-  - roles
+  - nvidiadrivers
   verbs:
   - create
   - delete
@@ -163,6 +179,29 @@ rules:
   - patch
   - update
   - watch
+- apiGroups:
+  - nvidia.com
+  resources:
+  - nvidiadrivers/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - nvidia.com
+  resources:
+  - nvidiadrivers/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - clusterrolebindings
+  - clusterroles
+  - rolebindings
+  - roles
+  verbs:
+  - '*'
 - apiGroups:
   - route.openshift.io
   resources:
@@ -195,3 +234,11 @@ rules:
   - patch
   - update
   - watch
+- apiGroups:
+  - security.openshift.io
+  resourceNames:
+  - privileged
+  resources:
+  - securitycontextconstraints
+  verbs:
+  - use

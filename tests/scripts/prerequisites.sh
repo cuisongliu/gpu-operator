@@ -1,4 +1,4 @@
-# !/bin/bash
+#!/bin/bash
 
 if [[ "${SKIP_PREREQUISITES}" == "true" ]]; then
     echo "Skipping prerequisites: SKIP_PREREQUISITES=${SKIP_PREREQUISITES}"
@@ -6,7 +6,7 @@ if [[ "${SKIP_PREREQUISITES}" == "true" ]]; then
 fi
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-source ${SCRIPT_DIR}/.definitions.sh
+source "${SCRIPT_DIR}"/.definitions.sh
 
 echo "Create log dir ${LOG_DIR}"
 mkdir -p "${LOG_DIR}"

@@ -18,20 +18,22 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
-	gpuv1 "github.com/NVIDIA/gpu-operator/api/v1"
 	"github.com/NVIDIA/k8s-operator-libs/pkg/consts"
 	"github.com/NVIDIA/k8s-operator-libs/pkg/upgrade"
 	"github.com/go-logr/logr"
@@ -39,6 +41,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	gpuv1 "github.com/NVIDIA/gpu-operator/api/nvidia/v1"
+	nvidiav1alpha1 "github.com/NVIDIA/gpu-operator/api/nvidia/v1alpha1"
 )
 
 // UpgradeReconciler reconciles Driver Daemon Sets for upgrade
@@ -46,7 +51,7 @@ type UpgradeReconciler struct {
 	client.Client
 	Log          logr.Logger
 	Scheme       *runtime.Scheme
-	StateManager *upgrade.ClusterUpgradeStateManager
+	StateManager upgrade.ClusterUpgradeStateManager
 }
 
 const (
@@ -55,8 +60,12 @@ const (
 	DriverLabelKey = "app"
 	// DriverLabelValue indicates pod label value of the driver
 	DriverLabelValue = "nvidia-driver-daemonset"
-	// UpgradeSkipDrainLabel indicates label to skip drain
-	UpgradeSkipDrainLabel = "nvidia.com/gpu.driver-upgrade-skip-drain"
+	// UpgradeSkipDrainLabelSelector indicates the pod selector label to skip with drain
+	UpgradeSkipDrainLabelSelector = "nvidia.com/gpu-driver-upgrade-drain.skip!=true"
+	// AppComponentLabelKey indicates the label key of the component
+	AppComponentLabelKey = "app.kubernetes.io/component"
+	// AppComponentLabelValue indicates the label values of the nvidia-gpu-driver component
+	AppComponentLabelValue = "nvidia-driver"
 )
 
 //nolint
@@ -74,13 +83,13 @@ func (r *UpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Fetch the ClusterPolicy instance
 	clusterPolicy := &gpuv1.ClusterPolicy{}
-	err := r.Client.Get(context.TODO(), req.NamespacedName, clusterPolicy)
+	err := r.Client.Get(ctx, req.NamespacedName, clusterPolicy)
 	if err != nil {
 		reqLogger.V(consts.LogLevelError).Error(err, "Error getting ClusterPolicy object")
 		if clusterPolicyCtrl.operatorMetrics != nil {
 			clusterPolicyCtrl.operatorMetrics.reconciliationStatus.Set(reconciliationStatusClusterPolicyUnavailable)
 		}
-		if errors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
 			// Request object not found, could have been deleted after reconcile request.
 			// Owned objects are automatically garbage collected. For additional cleanup logic use finalizers.
 			// Return and don't requeue
@@ -114,15 +123,28 @@ func (r *UpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		clusterPolicyCtrl.operatorMetrics.driverAutoUpgradeEnabled.Set(driverAutoUpgradeEnabled)
 	}
 
+	var driverLabel map[string]string
+
+	// initialize with common app=nvidia-driver-daemonset label
 	driverLabelKey := DriverLabelKey
 	driverLabelValue := DriverLabelValue
-	if clusterPolicyCtrl.openshift != "" && clusterPolicyCtrl.ocpDriverToolkit.enabled {
+
+	if clusterPolicy.Spec.Driver.UseNvdiaDriverCRDType() {
+		// app component label is added for all new driver daemonsets deployed by NVIDIADriver controller
+		driverLabelKey = AppComponentLabelKey
+		driverLabelValue = AppComponentLabelValue
+	} else if clusterPolicyCtrl.openshift != "" && clusterPolicyCtrl.ocpDriverToolkit.enabled {
 		// For OCP, when DTK is enabled app=nvidia-driver-daemonset label is not constant and changes
 		// based on rhcos version. Hence use DTK label instead
 		driverLabelKey = ocpDriverToolkitIdentificationLabel
 		driverLabelValue = ocpDriverToolkitIdentificationValue
 	}
-	state, err := r.StateManager.BuildState(ctx, clusterPolicyCtrl.operatorNamespace, map[string]string{driverLabelKey: driverLabelValue})
+
+	driverLabel = map[string]string{driverLabelKey: driverLabelValue}
+	reqLogger.Info("Using label selector", "key", driverLabelKey, "value", driverLabelValue)
+
+	state, err := r.StateManager.BuildState(ctx, clusterPolicyCtrl.operatorNamespace,
+		driverLabel)
 	if err != nil {
 		r.Log.Error(err, "Failed to build cluster upgrade state")
 		return ctrl.Result{}, err
@@ -139,6 +161,17 @@ func (r *UpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			r.Log.Error(err, "Failed to compute maxUnavailable from the current total nodes")
 			return ctrl.Result{}, err
 		}
+	}
+
+	// We want to skip operator itself during the drain because the upgrade process might hang
+	// if the operator is evicted and can't be rescheduled to any other node, e.g. in a single-node cluster.
+	// It's safe to do because the goal of the node draining during the upgrade is to
+	// evict pods that might use driver and operator doesn't use in its own pod.
+	if clusterPolicy.Spec.Driver.UpgradePolicy.DrainSpec.PodSelector == "" {
+		clusterPolicy.Spec.Driver.UpgradePolicy.DrainSpec.PodSelector = UpgradeSkipDrainLabelSelector
+	} else {
+		clusterPolicy.Spec.Driver.UpgradePolicy.DrainSpec.PodSelector =
+			fmt.Sprintf("%s,%s", clusterPolicy.Spec.Driver.UpgradePolicy.DrainSpec.PodSelector, UpgradeSkipDrainLabelSelector)
 	}
 
 	// log metrics with the current state
@@ -169,7 +202,7 @@ func (r *UpgradeReconciler) removeNodeUpgradeStateLabels(ctx context.Context) er
 	r.Log.Info("Resetting node upgrade labels from all nodes")
 
 	nodeList := &corev1.NodeList{}
-	err := r.List(ctx, nodeList)
+	err := r.Client.List(ctx, nodeList)
 	if err != nil {
 		r.Log.Error(err, "Failed to get node list to reset upgrade labels")
 		return err
@@ -182,7 +215,7 @@ func (r *UpgradeReconciler) removeNodeUpgradeStateLabels(ctx context.Context) er
 		_, present := node.Labels[upgradeStateLabel]
 		if present {
 			delete(node.Labels, upgradeStateLabel)
-			err = r.Update(ctx, node)
+			err = r.Client.Update(ctx, node)
 			if err != nil {
 				r.Log.V(consts.LogLevelError).Error(
 					err, "Failed to reset upgrade state label from node", "node", node)
@@ -196,7 +229,7 @@ func (r *UpgradeReconciler) removeNodeUpgradeStateLabels(ctx context.Context) er
 // SetupWithManager sets up the controller with the Manager.
 //
 //nolint:dupl
-func (r *UpgradeReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *UpgradeReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
 	// Create a new controller
 	c, err := controller.New("upgrade-controller", mgr, controller.Options{Reconciler: r, MaxConcurrentReconciles: 1, RateLimiter: workqueue.NewItemExponentialFailureRateLimiter(minDelayCR, maxDelayCR)})
 	if err != nil {
@@ -204,56 +237,101 @@ func (r *UpgradeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	// Watch for changes to primary resource ClusterPolicy
-	err = c.Watch(source.Kind(mgr.GetCache(), &gpuv1.ClusterPolicy{}), &handler.EnqueueRequestForObject{})
+	err = c.Watch(source.Kind(mgr.GetCache(), &gpuv1.ClusterPolicy{}), &handler.EnqueueRequestForObject{}, predicate.GenerationChangedPredicate{})
 	if err != nil {
 		return err
 	}
 
 	// Define a mapping from the Node object in the event to one or more
 	// ClusterPolicy objects to Reconcile
-	mapFn := func(ctx context.Context, a client.Object) []reconcile.Request {
-		// find all the ClusterPolicy to trigger their reconciliation
-		opts := []client.ListOption{} // Namespace = "" to list across all namespaces.
-		list := &gpuv1.ClusterPolicyList{}
-
-		err := mgr.GetClient().List(ctx, list, opts...)
-		if err != nil {
-			r.Log.Error(err, "Unable to list ClusterPolicies")
-			return []reconcile.Request{}
-		}
-
-		cpToRec := []reconcile.Request{}
-
-		for _, cp := range list.Items {
-			cpToRec = append(cpToRec, reconcile.Request{NamespacedName: types.NamespacedName{
-				Name:      cp.ObjectMeta.GetName(),
-				Namespace: cp.ObjectMeta.GetNamespace(),
-			}})
-		}
-
-		return cpToRec
+	nodeMapFn := func(ctx context.Context, a client.Object) []reconcile.Request {
+		return getClusterPoliciesToReconcile(ctx, mgr.GetClient())
 	}
 
 	// Watch for changes to node labels
 	// TODO: only watch for changes to upgrade state label
 	err = c.Watch(
 		source.Kind(mgr.GetCache(), &corev1.Node{}),
-		handler.EnqueueRequestsFromMapFunc(mapFn),
+		handler.EnqueueRequestsFromMapFunc(nodeMapFn),
 		predicate.LabelChangedPredicate{},
 	)
 	if err != nil {
 		return err
 	}
 
-	// Watch for changes to Daemonsets and requeue the owner ClusterPolicy.
-	// TODO: only watch for changes to driver Daemonset
+	// Define a mapping between the DaemonSet object in the event
+	// to one or more ClusterPolicy instances to reconcile.
+	//
+	// For events generated by DaemonSets, ensure the object is
+	// owned by either ClusterPolicy or NVIDIADriver.
+	dsMapFn := func(ctx context.Context, a client.Object) []reconcile.Request {
+		ownerRefs := a.GetOwnerReferences()
+
+		ownedByNVIDIA := false
+		for _, owner := range ownerRefs {
+			if (owner.APIVersion == gpuv1.SchemeGroupVersion.String() && owner.Kind == "ClusterPolicy") ||
+				(owner.APIVersion == nvidiav1alpha1.SchemeGroupVersion.String() && owner.Kind == "NVIDIADriver") {
+				ownedByNVIDIA = true
+				break
+			}
+		}
+
+		if !ownedByNVIDIA {
+			return nil
+		}
+
+		return getClusterPoliciesToReconcile(ctx, mgr.GetClient())
+	}
+
+	// Watch for changes to NVIDIA driver daemonsets and enqueue ClusterPolicy
+	// TODO: use one common label to identify all NVIDIA driver DaemonSets
+	appLabelSelector, err := predicate.LabelSelectorPredicate(metav1.LabelSelector{MatchLabels: map[string]string{DriverLabelKey: DriverLabelValue}})
+	if err != nil {
+		return fmt.Errorf("failed to create label selector predicate: %w", err)
+	}
+	dtkLabelSelector, err := predicate.LabelSelectorPredicate(metav1.LabelSelector{MatchLabels: map[string]string{ocpDriverToolkitIdentificationLabel: ocpDriverToolkitIdentificationValue}})
+	if err != nil {
+		return fmt.Errorf("failed to create label selector predicate: %w", err)
+	}
+	componentLabelSelector, err := predicate.LabelSelectorPredicate(metav1.LabelSelector{MatchLabels: map[string]string{AppComponentLabelKey: AppComponentLabelValue}})
+	if err != nil {
+		return fmt.Errorf("failed to create label selector predicate: %w", err)
+	}
+
 	err = c.Watch(
 		source.Kind(mgr.GetCache(), &appsv1.DaemonSet{}),
-		handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(), &gpuv1.ClusterPolicy{}, handler.OnlyControllerOwner()),
+		handler.EnqueueRequestsFromMapFunc(dsMapFn),
+		predicate.And(
+			predicate.GenerationChangedPredicate{},
+			predicate.Or(appLabelSelector, dtkLabelSelector, componentLabelSelector),
+		),
 	)
 	if err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func getClusterPoliciesToReconcile(ctx context.Context, k8sClient client.Client) []reconcile.Request {
+	logger := log.FromContext(ctx)
+	opts := []client.ListOption{}
+	list := &gpuv1.ClusterPolicyList{}
+
+	err := k8sClient.List(ctx, list, opts...)
+	if err != nil {
+		logger.Error(err, "Unable to list ClusterPolicies")
+		return []reconcile.Request{}
+	}
+
+	cpToRec := []reconcile.Request{}
+
+	for _, cp := range list.Items {
+		cpToRec = append(cpToRec, reconcile.Request{NamespacedName: types.NamespacedName{
+			Name:      cp.ObjectMeta.GetName(),
+			Namespace: cp.ObjectMeta.GetNamespace(),
+		}})
+	}
+
+	return cpToRec
 }

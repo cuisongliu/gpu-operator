@@ -1,3 +1,19 @@
+/**
+# Copyright (c) NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+**/
+
 package controllers
 
 import (
@@ -10,17 +26,16 @@ import (
 	"strings"
 	"testing"
 
-	gpuv1 "github.com/NVIDIA/gpu-operator/api/v1"
 	secv1 "github.com/openshift/api/security/v1"
 	promv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	nodev1 "k8s.io/api/node/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	schedv1 "k8s.io/api/scheduling/v1beta1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer/json"
@@ -30,6 +45,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+	gpuv1 "github.com/NVIDIA/gpu-operator/api/nvidia/v1"
 )
 
 const (
@@ -39,6 +56,7 @@ const (
 	vGPUManagerAssetsPath         = "assets/state-vgpu-manager/"
 	sandboxDevicePluginAssetsPath = "assets/state-sandbox-device-plugin"
 	devicePluginAssetsPath        = "assets/state-device-plugin/"
+	dcgmExporterAssetsPath        = "assets/state-dcgm-exporter/"
 	nfdNvidiaPCILabelKey          = "feature.node.kubernetes.io/pci-10de.present"
 	upgradedKernel                = "5.4.135-generic"
 )
@@ -51,7 +69,6 @@ type testConfig struct {
 var (
 	cfg                     *testConfig
 	clusterPolicyController ClusterPolicyController
-	clusterPolicyReconciler ClusterPolicyReconciler
 	clusterPolicy           gpuv1.ClusterPolicy
 	boolTrue                *bool
 	boolFalse               *bool
@@ -77,9 +94,8 @@ var kubernetesResources = []client.Object{
 	&corev1.Service{},
 	&promv1.ServiceMonitor{},
 	&schedv1.PriorityClass{},
-	//&corev1.Taint{},
+	// &corev1.Taint{},
 	&secv1.SecurityContextConstraints{},
-	&policyv1beta1.PodSecurityPolicy{},
 	&corev1.Namespace{},
 	&nodev1.RuntimeClass{},
 	&promv1.PrometheusRule{},
@@ -150,6 +166,9 @@ func setup() error {
 	if err := promv1.AddToScheme(s); err != nil {
 		return fmt.Errorf("unable to add promv1 schema: %v", err)
 	}
+	if err := apiextensionsv1.AddToScheme(s); err != nil {
+		return fmt.Errorf("unable to add apiextensionsv1 schema: %v", err)
+	}
 	if err := secv1.Install(s); err != nil {
 		return fmt.Errorf("unable to add secv1 schema: %v", err)
 	}
@@ -186,16 +205,12 @@ func setup() error {
 	}
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
-	clusterPolicyReconciler = ClusterPolicyReconciler{
-		Client: client,
-		Log:    ctrl.Log.WithName("controller").WithName("ClusterPolicy"),
-		Scheme: s,
-	}
-
 	clusterPolicyController = ClusterPolicyController{
 		ctx:       ctx,
 		singleton: cp,
-		rec:       &clusterPolicyReconciler,
+		client:    client,
+		logger:    ctrl.Log.WithName("controller").WithName("ClusterPolicy"),
+		scheme:    s,
 	}
 
 	clusterPolicyController.operatorMetrics = initOperatorMetrics(&clusterPolicyController)
@@ -256,8 +271,8 @@ func newCluster(nodes int, s *runtime.Scheme) (client.Client, error) {
 // updateClusterPolicy updates an existing ClusterPolicy instance
 func updateClusterPolicy(n *ClusterPolicyController, cp *gpuv1.ClusterPolicy) error {
 	n.singleton = cp
-	err := n.rec.Client.Update(n.ctx, cp)
-	if err != nil && !errors.IsConflict(err) {
+	err := n.client.Update(n.ctx, cp)
+	if err != nil && !apierrors.IsConflict(err) {
 		return fmt.Errorf("failed to update ClusterPolicy: %v", err)
 	}
 	return nil
@@ -270,7 +285,7 @@ func removeState(n *ClusterPolicyController, idx int) error {
 	var err error
 	for _, res := range kubernetesResources {
 		// TODO: use n.operatorNamespace once MR is merged
-		err = n.rec.Client.DeleteAllOf(n.ctx, res)
+		err = n.client.DeleteAllOf(n.ctx, res)
 		if err != nil {
 			return fmt.Errorf("error deleting objects from k8s client: %v", err)
 		}
@@ -376,6 +391,24 @@ func testDaemonsetCommon(t *testing.T, cp *gpuv1.ClusterPolicy, component string
 		if err != nil {
 			return nil, fmt.Errorf("unable to get mainCtrImage for sandbox-device-plugin: %v", err)
 		}
+	case "DCGMExporter":
+		spec = commonDaemonsetSpec{
+			repository:       cp.Spec.DCGMExporter.Repository,
+			image:            cp.Spec.DCGMExporter.Image,
+			version:          cp.Spec.DCGMExporter.Version,
+			imagePullPolicy:  cp.Spec.DCGMExporter.ImagePullPolicy,
+			imagePullSecrets: getImagePullSecrets(cp.Spec.DCGMExporter.ImagePullSecrets),
+			args:             cp.Spec.DCGMExporter.Args,
+			env:              cp.Spec.DCGMExporter.Env,
+			resources:        cp.Spec.DCGMExporter.Resources,
+		}
+		dsLabel = "nvidia-dcgm-exporter"
+		mainCtrName = "nvidia-dcgm-exporter"
+		manifestFile = filepath.Join(cfg.root, dcgmExporterAssetsPath)
+		mainCtrImage, err = gpuv1.ImagePath(&cp.Spec.DCGMExporter)
+		if err != nil {
+			return nil, fmt.Errorf("unable to get mainCtrImage for dcgm-exporter: %v", err)
+		}
 	default:
 		return nil, fmt.Errorf("invalid component for testDaemonsetCommon(): %s", component)
 	}
@@ -387,10 +420,8 @@ func testDaemonsetCommon(t *testing.T, cp *gpuv1.ClusterPolicy, component string
 	}
 
 	// add manifests
-	err = addState(&clusterPolicyController, manifestFile)
-	if err != nil {
-		t.Fatalf("unable to add state: %v", err)
-	}
+	addState(&clusterPolicyController, manifestFile)
+
 	// create resources
 	_, err = clusterPolicyController.step()
 	if err != nil {
@@ -401,7 +432,7 @@ func testDaemonsetCommon(t *testing.T, cp *gpuv1.ClusterPolicy, component string
 		client.MatchingLabels{"app": dsLabel},
 	}
 	list := &appsv1.DaemonSetList{}
-	err = clusterPolicyController.rec.Client.List(ctx, list, opts...)
+	err = clusterPolicyController.client.List(ctx, list, opts...)
 	if err != nil {
 		t.Fatalf("could not get DaemonSetList from client: %v", err)
 	}
@@ -461,10 +492,12 @@ func getDriverTestInput(testCase string) *gpuv1.ClusterPolicy {
 	cp.Spec.Driver.Repository = "nvcr.io/nvidia"
 	cp.Spec.Driver.Image = "driver"
 	cp.Spec.Driver.Version = "470.57.02"
+	cp.Spec.Driver.ImagePullSecrets = []string{"ngc-secret"}
 
 	cp.Spec.Driver.Manager.Repository = "nvcr.io/nvidia/cloud-native"
 	cp.Spec.Driver.Manager.Image = "k8s-driver-manager"
 	cp.Spec.Driver.Manager.Version = "test"
+	cp.Spec.Driver.Manager.ImagePullSecrets = []string{"ngc-secret"}
 
 	cp.Spec.Driver.StartupProbe = &gpuv1.ContainerProbeSpec{InitialDelaySeconds: 20, PeriodSeconds: 5, FailureThreshold: 1, TimeoutSeconds: 60}
 
@@ -486,10 +519,10 @@ func getDriverTestInput(testCase string) *gpuv1.ClusterPolicy {
 func getDriverTestOutput(testCase string) map[string]interface{} {
 	// default output
 	output := map[string]interface{}{
-		"numDaemonsets":          1,
-		"mofedValidationPresent": false,
-		"nvPeerMemPresent":       false,
-		"driverManagerImage":     "nvcr.io/nvidia/cloud-native/k8s-driver-manager:test",
+		"numDaemonsets":      1,
+		"nvPeerMemPresent":   false,
+		"driverManagerImage": "nvcr.io/nvidia/cloud-native/k8s-driver-manager:test",
+		"imagePullSecret":    "ngc-secret",
 	}
 
 	switch testCase {
@@ -534,14 +567,10 @@ func TestDriver(t *testing.T) {
 				return
 			}
 
-			mofedValidationPresent := false
 			nvPeerMemPresent := false
 			driverImage := ""
 			driverManagerImage := ""
 			for _, initContainer := range ds.Spec.Template.Spec.InitContainers {
-				if strings.Contains(initContainer.Name, "mofed-validation") {
-					mofedValidationPresent = true
-				}
 				if strings.Contains(initContainer.Name, "k8s-driver-manager") {
 					driverManagerImage = initContainer.Image
 				}
@@ -556,10 +585,11 @@ func TestDriver(t *testing.T) {
 				}
 			}
 
-			require.Equal(t, tc.output["mofedValidationPresent"], mofedValidationPresent, "Unexpected configuration for mofed-validation init container")
 			require.Equal(t, tc.output["nvPeerMemPresent"], nvPeerMemPresent, "Unexpected configuration for nv-peermem container")
 			require.Equal(t, tc.output["driverImage"], driverImage, "Unexpected configuration for nvidia-driver-ctr image")
 			require.Equal(t, tc.output["driverManagerImage"], driverManagerImage, "Unexpected configuration for k8s-driver-manager image")
+			require.Equal(t, len(ds.Spec.Template.Spec.ImagePullSecrets), 1, "Incorrect number of imagePullSecrets in the daemon set spec")
+			require.Equal(t, tc.output["imagePullSecret"], ds.Spec.Template.Spec.ImagePullSecrets[0].Name, "Incorrect imagePullSecret in the daemon set spec")
 
 			// cleanup by deleting all kubernetes objects
 			err = removeState(&clusterPolicyController, clusterPolicyController.idx-1)
@@ -581,10 +611,12 @@ func getDevicePluginTestInput(testCase string) *gpuv1.ClusterPolicy {
 	cp.Spec.DevicePlugin.Repository = "nvcr.io/nvidia"
 	cp.Spec.DevicePlugin.Image = "k8s-device-plugin"
 	cp.Spec.DevicePlugin.Version = "v0.12.0-ubi8"
+	cp.Spec.DevicePlugin.ImagePullSecrets = []string{"ngc-secret"}
 
 	cp.Spec.Validator.Repository = "nvcr.io/nvidia/cloud-native"
 	cp.Spec.Validator.Image = "gpu-operator-validator"
 	cp.Spec.Validator.Version = "v1.11.0"
+	cp.Spec.Validator.ImagePullSecrets = []string{"ngc-secret"}
 
 	switch testCase {
 	case "default":
@@ -607,6 +639,7 @@ func getDevicePluginTestOutput(testCase string) map[string]interface{} {
 		"configManagerInitPresent":    false,
 		"configManagerSidecarPresent": false,
 		"devicePluginImage":           "nvcr.io/nvidia/k8s-device-plugin:v0.12.0-ubi8",
+		"imagePullSecret":             "ngc-secret",
 	}
 
 	switch testCase {
@@ -715,6 +748,8 @@ func getVGPUManagerTestInput(testCase string) *gpuv1.ClusterPolicy {
 	cp.Spec.VGPUManager.DriverManager.Repository = "nvcr.io/nvidia/cloud-native"
 	cp.Spec.VGPUManager.DriverManager.Image = "k8s-driver-manager"
 	cp.Spec.VGPUManager.DriverManager.Version = "v0.3.0"
+	cp.Spec.VGPUManager.ImagePullSecrets = []string{"ngc-secret"}
+	cp.Spec.VGPUManager.DriverManager.ImagePullSecrets = []string{"ngc-secret"}
 	clusterPolicyController.sandboxEnabled = true
 
 	switch testCase {
@@ -735,6 +770,7 @@ func getVGPUManagerTestOutput(testCase string) map[string]interface{} {
 		"numDaemonsets":      1,
 		"driverImage":        "nvcr.io/nvidia/vgpu-manager:470.57.02-ubuntu22.04",
 		"driverManagerImage": "nvcr.io/nvidia/cloud-native/k8s-driver-manager:v0.3.0",
+		"imagePullSecret":    "ngc-secret",
 	}
 
 	switch testCase {
@@ -802,12 +838,10 @@ func TestVGPUManager(t *testing.T) {
 func TestVGPUManagerAssets(t *testing.T) {
 	manifestPath := filepath.Join(cfg.root, vGPUManagerAssetsPath)
 	// add manifests
-	err := addState(&clusterPolicyController, manifestPath)
-	if err != nil {
-		t.Fatalf("unable to add state: %v", err)
-	}
+	addState(&clusterPolicyController, manifestPath)
+
 	// create resources
-	_, err = clusterPolicyController.step()
+	_, err := clusterPolicyController.step()
 	if err != nil {
 		t.Errorf("error creating resources: %v", err)
 	}
@@ -824,10 +858,12 @@ func getSandboxDevicePluginTestInput(testCase string) *gpuv1.ClusterPolicy {
 	cp.Spec.SandboxDevicePlugin.Image = "kubevirt-device-plugin"
 	cp.Spec.SandboxDevicePlugin.Version = "v1.1.0"
 	clusterPolicyController.sandboxEnabled = true
+	cp.Spec.SandboxDevicePlugin.ImagePullSecrets = []string{"ngc-secret"}
 
 	cp.Spec.Validator.Repository = "nvcr.io/nvidia/cloud-native"
 	cp.Spec.Validator.Image = "gpu-operator-validator"
 	cp.Spec.Validator.Version = "v1.11.0"
+	cp.Spec.Validator.ImagePullSecrets = []string{"ngc-secret"}
 
 	switch testCase {
 	case "default":
@@ -844,8 +880,9 @@ func getSandboxDevicePluginTestInput(testCase string) *gpuv1.ClusterPolicy {
 func getSandboxDevicePluginTestOutput(testCase string) map[string]interface{} {
 	// default output
 	output := map[string]interface{}{
-		"numDaemonsets": 1,
-		"image":         "nvcr.io/nvidia/kubevirt-device-plugin:v1.1.0",
+		"numDaemonsets":   1,
+		"image":           "nvcr.io/nvidia/kubevirt-device-plugin:v1.1.0",
+		"imagePullSecret": "ngc-secret",
 	}
 
 	switch testCase {
@@ -906,13 +943,193 @@ func TestSandboxDevicePlugin(t *testing.T) {
 func TestSandboxDevicePluginAssets(t *testing.T) {
 	manifestPath := filepath.Join(cfg.root, sandboxDevicePluginAssetsPath)
 	// add manifests
-	err := addState(&clusterPolicyController, manifestPath)
-	if err != nil {
-		t.Fatalf("unable to add state: %v", err)
-	}
+	addState(&clusterPolicyController, manifestPath)
+
 	// create resources
-	_, err = clusterPolicyController.step()
+	_, err := clusterPolicyController.step()
 	if err != nil {
 		t.Errorf("error creating resources: %v", err)
+	}
+}
+
+func TestIsOpenKernelModulesRequired(t *testing.T) {
+	enable := true
+	disable := false
+	testCases := []struct {
+		description string
+		gds         *gpuv1.GPUDirectStorageSpec
+		output      bool
+	}{
+		{
+			"gds-disabled",
+			&gpuv1.GPUDirectStorageSpec{Enabled: &disable, Version: "v2.14.5"},
+			false,
+		},
+		{
+			"digest",
+			&gpuv1.GPUDirectStorageSpec{Enabled: &enable, Version: "sha256:8d1ec78f2b1ddb7f0c47453d0427231190747bda411733a7dd0c8f5196f09e9c"},
+			true,
+		},
+		{
+			"lower",
+			&gpuv1.GPUDirectStorageSpec{Enabled: &enable, Version: "v2.14.5"},
+			false,
+		},
+		{
+			"equal",
+			&gpuv1.GPUDirectStorageSpec{Enabled: &enable, Version: "v2.17.5"},
+			true,
+		},
+		{
+			"greater",
+			&gpuv1.GPUDirectStorageSpec{Enabled: &enable, Version: "v2.17.6"},
+			true,
+		},
+		{
+			"major-bump",
+			&gpuv1.GPUDirectStorageSpec{Enabled: &enable, Version: "v3.1.0"},
+			true,
+		},
+		{
+			"non-semver",
+			&gpuv1.GPUDirectStorageSpec{Enabled: &enable, Version: "2.14.5"},
+			false,
+		},
+		{
+			"non-semver-greater",
+			&gpuv1.GPUDirectStorageSpec{Enabled: &enable, Version: "2.17.6"},
+			true,
+		},
+		{
+			"lower-beta",
+			&gpuv1.GPUDirectStorageSpec{Enabled: &enable, Version: "2.14.6-beta"},
+			false,
+		},
+		{
+			"greater-beta",
+			&gpuv1.GPUDirectStorageSpec{Enabled: &enable, Version: "2.17.6-beta"},
+			true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.description, func(t *testing.T) {
+			isOpenRMRequired := tc.gds.IsOpenKernelModulesRequired()
+			require.Equal(t, tc.output, isOpenRMRequired, "Incorrect status from IsOpenKernelModulesRequired() for GDS driver")
+		})
+	}
+}
+
+// getDCGMExporterTestInput return a ClusterPolicy instance for a particular
+// dcgm-exporter test case.
+func getDCGMExporterTestInput(testCase string) *gpuv1.ClusterPolicy {
+	cp := clusterPolicy.DeepCopy()
+
+	// Set some default values
+	cp.Spec.DCGMExporter.Repository = "nvcr.io/nvidia/k8s"
+	cp.Spec.DCGMExporter.Image = "dcgm-exporter"
+	cp.Spec.DCGMExporter.Version = "3.3.0-3.2.0-ubuntu22.04"
+	cp.Spec.DCGMExporter.ImagePullSecrets = []string{"ngc-secret"}
+
+	cp.Spec.Validator.Repository = "nvcr.io/nvidia/cloud-native"
+	cp.Spec.Validator.Image = "gpu-operator-validator"
+	cp.Spec.Validator.Version = "v23.9.2"
+	cp.Spec.Validator.ImagePullSecrets = []string{"ngc-secret"}
+
+	switch testCase {
+	case "default":
+		// Do nothing
+	case "standalone-dcgm":
+		dcgmEnabled := true
+		cp.Spec.DCGM.Enabled = &dcgmEnabled
+	default:
+		return nil
+	}
+
+	return cp
+}
+
+// getDCGMExporterTestOutput returns a map containing expected output for
+// dcgm-exporter test case.
+func getDCGMExporterTestOutput(testCase string) map[string]interface{} {
+	// default output
+	output := map[string]interface{}{
+		"numDaemonsets":     1,
+		"dcgmExporterImage": "nvcr.io/nvidia/k8s/dcgm-exporter:3.3.0-3.2.0-ubuntu22.04",
+		"imagePullSecret":   "ngc-secret",
+	}
+
+	switch testCase {
+	case "default":
+		output["env"] = map[string]string{}
+	case "standalone-dcgm":
+		output["env"] = map[string]string{
+			"DCGM_REMOTE_HOSTENGINE_INFO": "nvidia-dcgm:5555",
+		}
+	default:
+		return nil
+	}
+
+	return output
+}
+
+// TestDCGMExporter tests that the GPU Operator correctly deploys the dcgm-exporter daemonset
+// under various scenarios/config options
+func TestDCGMExporter(t *testing.T) {
+	testCases := []struct {
+		description   string
+		clusterPolicy *gpuv1.ClusterPolicy
+		output        map[string]interface{}
+	}{
+		{
+			"Default",
+			getDCGMExporterTestInput("default"),
+			getDCGMExporterTestOutput("default"),
+		},
+		{
+			"StandalongDCGM",
+			getDCGMExporterTestInput("standalone-dcgm"),
+			getDCGMExporterTestOutput("standalone-dcgm"),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.description, func(t *testing.T) {
+			ds, err := testDaemonsetCommon(t, tc.clusterPolicy, "DCGMExporter", tc.output["numDaemonsets"].(int))
+			if err != nil {
+				t.Fatalf("error in testDaemonsetCommon(): %v", err)
+			}
+			if ds == nil {
+				return
+			}
+
+			dcgmExporterImage := ""
+			for _, container := range ds.Spec.Template.Spec.Containers {
+				if container.Name == "nvidia-dcgm-exporter" {
+					dcgmExporterImage = container.Image
+					break
+				}
+			}
+			for key, value := range tc.output["env"].(map[string]string) {
+				envFound := false
+				for _, envVar := range ds.Spec.Template.Spec.Containers[0].Env {
+					if envVar.Name == key && envVar.Value == value {
+						envFound = true
+					}
+				}
+				if !envFound {
+					t.Fatalf("Expected env is not set for daemonset nvidia-dcgm-exporter %s->%s", key, value)
+				}
+			}
+
+			require.Equal(t, tc.output["dcgmExporterImage"], dcgmExporterImage, "Unexpected configuration for dcgm-exporter image")
+
+			// cleanup by deleting all kubernetes objects
+			err = removeState(&clusterPolicyController, clusterPolicyController.idx-1)
+			if err != nil {
+				t.Fatalf("error removing state %v:", err)
+			}
+			clusterPolicyController.idx--
+		})
 	}
 }

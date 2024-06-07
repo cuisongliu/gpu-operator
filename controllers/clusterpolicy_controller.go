@@ -18,12 +18,14 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/go-logr/logr"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
@@ -39,12 +41,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
-	gpuv1 "github.com/NVIDIA/gpu-operator/api/v1"
+	"github.com/NVIDIA/k8s-operator-libs/pkg/consts"
+
+	gpuv1 "github.com/NVIDIA/gpu-operator/api/nvidia/v1"
+	"github.com/NVIDIA/gpu-operator/internal/conditions"
 )
 
 const (
-	minDelayCR = 100 * time.Millisecond
-	maxDelayCR = 3 * time.Second
+	minDelayCR                      = 100 * time.Millisecond
+	maxDelayCR                      = 3 * time.Second
+	clusterPolicyControllerIndexKey = "metadata.nvidia.clusterpolicy.controller"
 )
 
 // blank assignment to verify that ReconcileClusterPolicy implements reconcile.Reconciler
@@ -54,23 +60,27 @@ var clusterPolicyCtrl ClusterPolicyController
 // ClusterPolicyReconciler reconciles a ClusterPolicy object
 type ClusterPolicyReconciler struct {
 	client.Client
-	Log    logr.Logger
-	Scheme *runtime.Scheme
+	Log              logr.Logger
+	Scheme           *runtime.Scheme
+	conditionUpdater conditions.Updater
 }
 
 // +kubebuilder:rbac:groups=nvidia.com,resources=*,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=config.openshift.io,resources=clusterversions;proxies,verbs=get;list;watch
 // +kubebuilder:rbac:groups=security.openshift.io,resources=securitycontextconstraints,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings;roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=security.openshift.io,resources=securitycontextconstraints,verbs=use,resourceNames=privileged
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings;roles;rolebindings,verbs=*
 // +kubebuilder:rbac:groups="",resources=namespaces;serviceaccounts;pods;pods/eviction;services;services/finalizers;endpoints,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims;events;configmaps;secrets;nodes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments;daemonsets;replicasets;statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=controllerrevisions,verbs=get;list;watch
-// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors;prometheusrule,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors;prometheusrules,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=scheduling.k8s.io,resources=priorityclasses,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=route.openshift.io,resources=routes,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=image.openshift.io,resources=imagestreams,verbs=get;list;watch
+// +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get;list;create;update;watch;delete
+// +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -86,16 +96,23 @@ func (r *ClusterPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// Fetch the ClusterPolicy instance
 	instance := &gpuv1.ClusterPolicy{}
+	var condErr error
 	err := r.Client.Get(ctx, req.NamespacedName, instance)
 	if err != nil {
+		err = fmt.Errorf("Failed to get ClusterPolicy object: %v", err)
+		r.Log.Error(nil, err.Error())
 		clusterPolicyCtrl.operatorMetrics.reconciliationStatus.Set(reconciliationStatusClusterPolicyUnavailable)
-		if errors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
 			// Request object not found, could have been deleted after reconcile request.
 			// Owned objects are automatically garbage collected. For additional cleanup logic use finalizers.
 			// Return and don't requeue
 			return reconcile.Result{}, nil
 		}
 		// Error reading the object - requeue the request.
+		condErr = r.conditionUpdater.SetConditionsError(ctx, instance, conditions.ReconcileFailed, err.Error())
+		if condErr != nil {
+			r.Log.V(consts.LogLevelDebug).Error(nil, condErr.Error())
+		}
 		return reconcile.Result{}, err
 	}
 
@@ -110,8 +127,12 @@ func (r *ClusterPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	err = clusterPolicyCtrl.init(ctx, r, instance)
 	if err != nil {
-		r.Log.Error(err, "Failed to initialize ClusterPolicy controller")
-
+		err = fmt.Errorf("Failed to initialize ClusterPolicy controller: %v", err)
+		r.Log.Error(nil, err.Error())
+		condErr = r.conditionUpdater.SetConditionsError(ctx, instance, conditions.ReconcileFailed, err.Error())
+		if condErr != nil {
+			r.Log.V(consts.LogLevelDebug).Error(nil, condErr.Error())
+		}
 		if clusterPolicyCtrl.operatorMetrics != nil {
 			clusterPolicyCtrl.operatorMetrics.reconciliationStatus.Set(reconciliationStatusClusterPolicyUnavailable)
 		}
@@ -137,14 +158,14 @@ func (r *ClusterPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			clusterPolicyCtrl.operatorMetrics.reconciliationStatus.Set(reconciliationStatusNotReady)
 			clusterPolicyCtrl.operatorMetrics.reconciliationFailed.Inc()
 			updateCRState(ctx, r, req.NamespacedName, gpuv1.NotReady)
+			condErr = r.conditionUpdater.SetConditionsError(ctx, instance, conditions.ReconcileFailed, fmt.Sprintf("Failed to reconcile %s: %s", clusterPolicyCtrl.stateNames[clusterPolicyCtrl.idx], statusError.Error()))
+			if condErr != nil {
+				r.Log.V(consts.LogLevelDebug).Error(nil, condErr.Error())
+			}
 			return ctrl.Result{RequeueAfter: time.Second * 5}, statusError
 		}
 
 		if status == gpuv1.NotReady {
-			// if CR was previously set to ready(prior reboot etc), reset it to current state
-			if instance.Status.State == gpuv1.Ready {
-				updateCRState(ctx, r, req.NamespacedName, gpuv1.NotReady)
-			}
 			overallStatus = gpuv1.NotReady
 			statesNotReady = append(statesNotReady, clusterPolicyCtrl.stateNames[clusterPolicyCtrl.idx-1])
 		}
@@ -162,8 +183,13 @@ func (r *ClusterPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		clusterPolicyCtrl.operatorMetrics.reconciliationStatus.Set(reconciliationStatusNotReady)
 		clusterPolicyCtrl.operatorMetrics.reconciliationFailed.Inc()
 
-		r.Log.Info("ClusterPolicy isn't ready", "states not ready", statesNotReady)
-
+		errStr := fmt.Sprintf("ClusterPolicy is not ready, states not ready: %v", statesNotReady)
+		r.Log.Error(nil, errStr)
+		updateCRState(ctx, r, req.NamespacedName, gpuv1.NotReady)
+		condErr = r.conditionUpdater.SetConditionsError(ctx, instance, conditions.OperandNotReady, errStr)
+		if condErr != nil {
+			r.Log.V(consts.LogLevelDebug).Error(nil, condErr.Error())
+		}
 		return ctrl.Result{RequeueAfter: time.Second * 5}, nil
 	}
 
@@ -175,8 +201,13 @@ func (r *ClusterPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			"requeueAfter", requeueAfter)
 
 		// Update CR state as ready as all states are complete
-		updateCRState(ctx, r, req.NamespacedName, gpuv1.NotReady)
-		clusterPolicyCtrl.operatorMetrics.reconciliationStatus.Set(reconciliationStatusNotReady)
+		updateCRState(ctx, r, req.NamespacedName, gpuv1.Ready)
+		condErr = r.conditionUpdater.SetConditionsReady(ctx, instance, conditions.NFDLabelsMissing, "No NFD labels found")
+		if condErr != nil {
+			r.Log.V(consts.LogLevelDebug).Error(nil, condErr.Error())
+		}
+
+		clusterPolicyCtrl.operatorMetrics.reconciliationStatus.Set(reconciliationStatusSuccess)
 
 		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
@@ -186,35 +217,40 @@ func (r *ClusterPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	clusterPolicyCtrl.operatorMetrics.reconciliationStatus.Set(reconciliationStatusSuccess)
 	clusterPolicyCtrl.operatorMetrics.reconciliationLastSuccess.Set(float64(time.Now().Unix()))
 
+	var infoStr string
 	if !clusterPolicyCtrl.hasGPUNodes {
-		r.Log.Info("No GPU node found, watching for new nodes to join the cluster.", "hasNFDLabels", clusterPolicyCtrl.hasNFDLabels)
+		infoStr = "No GPU node found, watching for new nodes to join the cluster."
+		r.Log.Info(infoStr, "hasNFDLabels", clusterPolicyCtrl.hasNFDLabels)
+		if condErr = r.conditionUpdater.SetConditionsReady(ctx, instance, conditions.NoGPUNodes, infoStr); condErr != nil {
+			return ctrl.Result{}, condErr
+		}
 	} else {
-		r.Log.Info("ClusterPolicy is ready.")
+		infoStr = "ClusterPolicy is ready as all resources have been successfully reconciled"
+		r.Log.Info(infoStr)
+		if condErr = r.conditionUpdater.SetConditionsReady(ctx, instance, conditions.Reconciled, infoStr); condErr != nil {
+			return ctrl.Result{}, condErr
+		}
 	}
-
 	return ctrl.Result{}, nil
 }
 
-func updateCRState(ctx context.Context, r *ClusterPolicyReconciler, namespacedName types.NamespacedName, state gpuv1.State) error {
+func updateCRState(ctx context.Context, r *ClusterPolicyReconciler, namespacedName types.NamespacedName, state gpuv1.State) {
 	// Fetch latest instance and update state to avoid version mismatch
 	instance := &gpuv1.ClusterPolicy{}
 	err := r.Client.Get(ctx, namespacedName, instance)
 	if err != nil {
 		r.Log.Error(err, "Failed to get ClusterPolicy instance for status update")
-		return err
 	}
 	if instance.Status.State == state {
 		// state is unchanged
-		return nil
+		return
 	}
 	// Update the CR state
 	instance.SetStatus(state, clusterPolicyCtrl.operatorNamespace)
 	err = r.Client.Status().Update(ctx, instance)
 	if err != nil {
 		r.Log.Error(err, "Failed to update ClusterPolicy status")
-		return err
 	}
-	return nil
 }
 
 func addWatchNewGPUNode(ctx context.Context, r *ClusterPolicyReconciler, c controller.Controller, mgr ctrl.Manager) error {
@@ -225,7 +261,7 @@ func addWatchNewGPUNode(ctx context.Context, r *ClusterPolicyReconciler, c contr
 		opts := []client.ListOption{} // Namespace = "" to list across all namespaces.
 		list := &gpuv1.ClusterPolicyList{}
 
-		err := r.List(ctx, list, opts...)
+		err := r.Client.List(ctx, list, opts...)
 		if err != nil {
 			r.Log.Error(err, "Unable to list ClusterPolicies")
 			return []reconcile.Request{}
@@ -264,8 +300,8 @@ func addWatchNewGPUNode(ctx context.Context, r *ClusterPolicyReconciler, c contr
 			newGPUWorkloadConfig, _ := getWorkloadConfig(newLabels, true)
 			gpuWorkloadConfigLabelChanged := oldGPUWorkloadConfig != newGPUWorkloadConfig
 
-			oldOSTreeLabel, _ := oldLabels[nfdOSTreeVersionLabelKey]
-			newOSTreeLabel, _ := newLabels[nfdOSTreeVersionLabelKey]
+			oldOSTreeLabel := oldLabels[nfdOSTreeVersionLabelKey]
+			newOSTreeLabel := newLabels[nfdOSTreeVersionLabelKey]
 			osTreeLabelChanged := oldOSTreeLabel != newOSTreeLabel
 
 			needsUpdate := gpuCommonLabelMissing ||
@@ -286,7 +322,6 @@ func addWatchNewGPUNode(ctx context.Context, r *ClusterPolicyReconciler, c contr
 					"osTreeLabelChanged", osTreeLabelChanged,
 				)
 			}
-
 			return needsUpdate
 		},
 		DeleteFunc: func(e event.DeleteEvent) bool {
@@ -321,8 +356,11 @@ func (r *ClusterPolicyReconciler) SetupWithManager(ctx context.Context, mgr ctrl
 		return err
 	}
 
+	// initialize condition updater
+	r.conditionUpdater = conditions.NewClusterPolicyUpdater(mgr.GetClient())
+
 	// Watch for changes to primary resource ClusterPolicy
-	err = c.Watch(source.Kind(mgr.GetCache(), &gpuv1.ClusterPolicy{}), &handler.EnqueueRequestForObject{})
+	err = c.Watch(source.Kind(mgr.GetCache(), &gpuv1.ClusterPolicy{}), &handler.EnqueueRequestForObject{}, predicate.GenerationChangedPredicate{})
 	if err != nil {
 		return err
 	}
@@ -338,6 +376,31 @@ func (r *ClusterPolicyReconciler) SetupWithManager(ctx context.Context, mgr ctrl
 	err = c.Watch(source.Kind(mgr.GetCache(), &appsv1.DaemonSet{}), handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(), &gpuv1.ClusterPolicy{}, handler.OnlyControllerOwner()))
 	if err != nil {
 		return err
+	}
+
+	// Add an index key which allows our reconciler to quickly look up DaemonSets owned by it.
+	//
+	// (cdesiniotis) Ideally we could duplicate this index for all the k8s objects
+	// that ClusterPolicy manages, that way, we could easily restrict the ClusterPolicy
+	// controller to only update / delete objects it owns. Unfortunately, the
+	// underlying implementation of the index does not support generic container types
+	// (i.e. unstructured.Unstructured{}). For additional details, see the comment in
+	// the last link of the below call stack:
+	// IndexField(): https://github.com/kubernetes-sigs/controller-runtime/blob/main/pkg/cache/informer_cache.go#L204
+	//   GetInformer(): https://github.com/kubernetes-sigs/controller-runtime/blob/main/pkg/cache/informer_cache.go#L168
+	//     GVKForObject(): https://github.com/kubernetes-sigs/controller-runtime/blob/main/pkg/client/apiutil/apimachinery.go#L113
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &appsv1.DaemonSet{}, clusterPolicyControllerIndexKey, func(rawObj client.Object) []string {
+		ds := rawObj.(*appsv1.DaemonSet)
+		owner := metav1.GetControllerOf(ds)
+		if owner == nil {
+			return nil
+		}
+		if owner.APIVersion != gpuv1.SchemeGroupVersion.String() || owner.Kind != "ClusterPolicy" {
+			return nil
+		}
+		return []string{owner.Name}
+	}); err != nil {
+		return fmt.Errorf("failed to add index key: %w", err)
 	}
 
 	return nil

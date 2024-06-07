@@ -16,27 +16,19 @@ rules:
   - ""
   resources:
   - pods
-  - nodes
   verbs:
-  - '*'
+  - create
+  - get
+  - list
+  - watch
+  - update
+  - patch
+  - delete
 - apiGroups:
   - apps
   resources:
-  - deployments
   - daemonsets
   verbs:
-  - '*'
-- apiGroups:
-  - policy
-  resources:
-  - podsecuritypolicies
-  verbs:
-  - use
-  resourceNames:
-  - gpu-operator-privileged
-- apiGroups:
-  - nvidia.com
-  resources:
-  - clusterpolicies/finalizers
-  verbs:
-  - '*'
+  - get
+  - list
+  - watch

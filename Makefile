@@ -76,67 +76,69 @@ endif
 
 all: gpu-operator
 
-# Run tests
-ENVTEST_ASSETS_DIR=$(shell pwd)/testbin
-test: generate fmt vet manifests
-	mkdir -p ${ENVTEST_ASSETS_DIR}
-	test -f ${ENVTEST_ASSETS_DIR}/setup-envtest.sh || curl -sSLo ${ENVTEST_ASSETS_DIR}/setup-envtest.sh https://raw.githubusercontent.com/kubernetes-sigs/controller-runtime/v0.7.0/hack/setup-envtest.sh
-	source ${ENVTEST_ASSETS_DIR}/setup-envtest.sh; fetch_envtest_tools $(ENVTEST_ASSETS_DIR); setup_envtest_env $(ENVTEST_ASSETS_DIR); go test ./... -coverprofile cover.out
+GOOS ?= linux
+VERSION_PKG = github.com/NVIDIA/gpu-operator/internal/info
+
+CLIENT_GEN = $(shell pwd)/bin/client-gen
+CONTROLLER_GEN = $(shell pwd)/bin/controller-gen
+KUSTOMIZE = $(shell pwd)/bin/kustomize
 
 # Build gpu-operator binary
-gpu-operator: generate fmt vet
-	go build -o bin/gpu-operator main.go
+gpu-operator:
+	CGO_ENABLED=0 GOOS=$(GOOS) \
+		go build -ldflags "-s -w -X $(VERSION_PKG).gitCommit=$(GIT_COMMIT) -X $(VERSION_PKG).version=$(VERSION)" -o gpu-operator ./cmd/gpu-operator/...
 
 # Run against the configured Kubernetes cluster in ~/.kube/config
-run: generate fmt vet manifests
-	go run ./main.go
+run: generate check manifests
+	go run ./cmd/gpu-operator/...
 
 # Install CRDs into a cluster
-install: manifests kustomize
+install: manifests install-tools
 	$(KUSTOMIZE) build config/crd | kubectl apply -f -
 
 # Uninstall CRDs from a cluster
-uninstall: manifests kustomize
+uninstall: manifests install-tools
 	$(KUSTOMIZE) build config/crd | kubectl delete -f -
 
 # Deploy gpu-operator in the configured Kubernetes cluster in ~/.kube/config
-deploy: manifests kustomize
+deploy: manifests generate-env install-tools
 	cd config/manager && $(KUSTOMIZE) edit set image gpu-operator=${IMAGE}
 	$(KUSTOMIZE) build config/default | kubectl apply -f -
+
+generate-env:
+	./hack/prepare-env.sh
 
 # UnDeploy gpu-operator from the configured Kubernetes cluster in ~/.kube/config
 undeploy:
 	$(KUSTOMIZE) build config/default | kubectl delete -f -
 
 # Generate manifests e.g. CRD, RBAC etc.
-manifests: controller-gen
+manifests: install-tools
 	$(CONTROLLER_GEN) rbac:roleName=gpu-operator-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
 
 # Generate code
-generate: controller-gen
+generate: install-tools
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
 
-# Download controller-gen locally if necessary
-CONTROLLER_GEN = $(shell pwd)/bin/controller-gen
-controller-gen:
-	@GOBIN=$(PROJECT_DIR)/bin GO111MODULE=on $(GO_CMD) install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.8.0
-
-# Download kustomize locally if necessary
-KUSTOMIZE = $(shell pwd)/bin/kustomize
-kustomize:
-	@GOBIN=$(PROJECT_DIR)/bin GO111MODULE=on $(GO_CMD) install sigs.k8s.io/kustomize/kustomize/v4@v4.5.2
+generate-clientset: install-tools
+	$(CLIENT_GEN) --go-header-file=$(CURDIR)/hack/boilerplate.go.txt \
+		--clientset-name "versioned" \
+		--output-dir $(CURDIR)/api \
+		--output-pkg $(MODULE)/api \
+		--input-base $(CURDIR)/api \
+		--input nvidia/v1,nvidia/v1alpha1
 
 # Generate bundle manifests and metadata, then validate generated files.
 .PHONY: bundle
-bundle: manifests kustomize
+bundle: manifests install-tools
 	operator-sdk generate kustomize manifests -q
-	cd config/manager && $(KUSTOMIZE) edit set image gpu-opertor=$(IMAGE)
+	cd config/manager && $(KUSTOMIZE) edit set image gpu-operator=$(IMAGE)
 	$(KUSTOMIZE) build config/manifests | operator-sdk generate bundle -q --overwrite --version $(VERSION) $(BUNDLE_METADATA_OPTS)
 	operator-sdk bundle validate ./bundle
 
 # Build the bundle image.
 build-bundle-image:
-	docker build \
+	$(DOCKER) build \
 	--build-arg VERSION=$(VERSION) \
 	--build-arg DEFAULT_CHANNEL=$(DEFAULT_CHANNEL) \
 	--build-arg GIT_COMMIT=$(GIT_COMMIT) \
@@ -144,14 +146,14 @@ build-bundle-image:
 
 # Push the bundle image.
 push-bundle-image: build-bundle-image
-	docker push $(BUNDLE_IMAGE)
+	$(DOCKER) push $(BUNDLE_IMAGE)
 
 # Define local and dockerized golang targets
 
 CMDS := $(patsubst ./cmd/%/,%,$(sort $(dir $(wildcard ./cmd/*/))))
 CMD_TARGETS := $(patsubst %,cmd-%, $(CMDS))
 
-CHECK_TARGETS := assert-fmt vet lint ineffassign misspell
+CHECK_TARGETS := lint license-check validate-modules validate-generated-assets
 MAKE_TARGETS := build check coverage cmds $(CMD_TARGETS) $(CHECK_TARGETS)
 DOCKER_TARGETS := $(patsubst %,docker-%, $(MAKE_TARGETS))
 .PHONY: $(MAKE_TARGETS) $(DOCKER_TARGETS)
@@ -179,6 +181,7 @@ $(DOCKER_TARGETS): docker-%: .build-image
 	@echo "Running 'make $(*)' in docker container $(BUILDIMAGE)"
 	$(DOCKER) run \
 		--rm \
+		-e GOLANGCI_LINT_CACHE=/tmp/.cache \
 		-e GOCACHE=/tmp/.cache \
 		-v $(PWD):$(PWD) \
 		-w $(PWD) \
@@ -188,31 +191,28 @@ $(DOCKER_TARGETS): docker-%: .build-image
 
 check: $(CHECK_TARGETS)
 
+license-check:
+	@echo ">> checking license header"
+	@licRes=$$(for file in $$(find . -type f -iname '*.go' ! -path './vendor/*') ; do \
+               awk 'NR<=5' $$file | grep -Eq "(Copyright|generated|GENERATED)" || echo $$file; \
+       done); \
+       if [ -n "$${licRes}" ]; then \
+               echo "license header checking failed:"; echo "$${licRes}"; \
+               exit 1; \
+       fi
+
 # Apply go fmt to the codebase
 fmt:
 	go list -f '{{.Dir}}' $(MODULE)/... \
-		| xargs gofmt -s -l -w
+		| xargs gofmt -s -l -d
 
-assert-fmt:
-	go list -f '{{.Dir}}' $(MODULE)/... \
-		| xargs gofmt -s -l | ( grep -v /vendor/ || true ) > fmt.out
-	@if [ -s fmt.out ]; then \
-		echo "\nERROR: The following files are not formatted:\n"; \
-		cat fmt.out; \
-		rm fmt.out; \
-		exit 1; \
-	else \
-		rm fmt.out; \
-	fi
+# Apply goimports -local github.com/NVIDIA/gpu-operator to the codebase
+goimports:
+	find . -name \*.go -not -name "zz_generated.deepcopy.go" -not -path "./vendor/*" \
+ 		-exec goimports -local $(MODULE) -w {} \;
 
-ineffassign:
-	golangci-lint run --disable-all --enable ineffassign ./...
-
-misspell:
-	golangci-lint run --disable-all --enable misspell ./...
-
-vet:
-	go vet ./...
+lint:
+	golangci-lint run ./...
 
 cmds: $(CMD_TARGETS)
 $(CMD_TARGETS): cmd-%:
@@ -239,9 +239,14 @@ validate-helm-values: cmds
 		sed '/^--/d' | \
 		./gpuop-cfg validate clusterpolicy --input="-"
 
+validate-generated-assets: manifests generate generate-clientset
+	@echo "- Verifying that the generated code and manifests are in-sync..."
+	@git diff --exit-code -- api config
+
 COVERAGE_FILE := coverage.out
 unit-test: build
-	go test -v -coverprofile=$(COVERAGE_FILE) $(MODULE)/...
+	go list -f {{.Dir}} $(MODULE)/... | grep -v /tests/e2e \
+		| xargs go test -v -coverprofile=$(COVERAGE_FILE)
 
 coverage: unit-test
 	cat $(COVERAGE_FILE) | grep -v "_mock.go" > $(COVERAGE_FILE).no-mocks
@@ -305,3 +310,8 @@ $(BUILD_TARGETS): build-%:
 docker-image: OUT_IMAGE ?= $(IMAGE_NAME):$(IMAGE_TAG)
 docker-image: ${DEFAULT_PUSH_TARGET}
 endif
+
+install-tools:
+	@echo Installing tools from tools.go
+	export GOBIN=$(PROJECT_DIR)/bin && \
+	grep '^\s*_' tools/tools.go | awk '{print $$2}' | xargs -tI % $(GO_CMD) install -mod=readonly -modfile=tools/go.mod %

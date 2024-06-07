@@ -20,10 +20,11 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/NVIDIA/go-nvlib/pkg/nvpci"
+
 	"github.com/NVIDIA/nvidia-container-toolkit/internal/info/proc/devices"
 	"github.com/NVIDIA/nvidia-container-toolkit/internal/logger"
 	"github.com/NVIDIA/nvidia-container-toolkit/internal/nvcaps"
-	"gitlab.com/nvidia/cloud-native/go-nvlib/pkg/nvpci"
 )
 
 type allPossible struct {
@@ -73,6 +74,7 @@ func newAllPossible(logger logger.Interface, devRoot string) (nodeLister, error)
 func (m allPossible) DeviceNodes() ([]deviceNode, error) {
 	gpus, err := nvpci.New(
 		nvpci.WithPCIDevicesRoot(filepath.Join(m.devRoot, nvpci.PCIDevicesRoot)),
+		nvpci.WithLogger(m.logger),
 	).GetGPUs()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get GPU information: %v", err)
